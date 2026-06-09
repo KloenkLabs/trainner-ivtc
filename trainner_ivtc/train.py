@@ -165,8 +165,7 @@ def train(config: dict[str, Any]) -> None:
             if step % int(training["print_freq"]) == 0:
                 now = time.perf_counter()
                 recent_it_s = (step - last_log_step) / max(now - last_log_time, 1e-9)
-                epoch_it_s = step / max(now - epoch_start_time, 1e-9)
-                logger.info("epoch=%d step=%d/%d loss=%.5f it_s=%.3f epoch_it_s=%.3f", epoch, step, len(train_loader), running_loss / step, recent_it_s, epoch_it_s)
+                logger.info("epoch=%d step=%d/%d loss=%.5f it_s=%.3f", epoch, step, len(train_loader), running_loss / step, recent_it_s)
                 last_log_time = now
                 last_log_step = step
         train_elapsed = time.perf_counter() - epoch_start_time

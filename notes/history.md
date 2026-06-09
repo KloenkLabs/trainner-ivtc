@@ -52,3 +52,5 @@
 | 2026-06-09 14:36 | Codex | Explained the YAML settings: set `data.noise_std: 0.0` and set `scene_cut`/`unknown` weights to `0.0` while keeping other class weights positive. TLDR: zero weights are allowed; distribution is normalized at sampling time. |  |
 | 2026-06-09 15:24 | User | Asked to add it/s to training progress prints. |  |
 | 2026-06-09 15:24 | Codex | Added recent interval `it_s`, epoch-average `epoch_it_s`, and per-epoch `train_it_s` to training `logger.info` output. | trainner_ivtc/train.py |
+| 2026-06-09 15:35 | User | Asked whether large apparent loss drops at new epoch boundaries are expected. |  |
+| 2026-06-09 15:35 | Codex | Explained that printed step loss is a per-epoch running average, so epoch-boundary drops compare different averaging windows after the model has already improved. TLDR: expected; add recent-loss logging if this should be easier to read. | notes/history.md |
