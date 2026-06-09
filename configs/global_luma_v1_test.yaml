@@ -1,0 +1,48 @@
+seed: 1234
+
+paths:
+    dataset_dir: datasets/synthetic_global_luma_v1_test
+    output_dir: experiments/global_luma_v1_test
+
+data:
+    source_dirs:
+        - datasets/gt_test1
+    field_order: tff
+    window_frames: 11
+    height: 400
+    width: 640
+    num_workers: auto
+    train_samples: 32
+    val_samples: 8
+    noise_std: 2.0
+    class_distribution:
+        film_phase_0: 0.13
+        film_phase_1: 0.13
+        film_phase_2: 0.13
+        film_phase_3: 0.13
+        film_phase_4: 0.13
+        video: 0.15
+        blend: 0.08
+        scene_cut: 0.06
+        unknown: 0.06
+
+model:
+    base_channels: 16
+    channel_mult: [1, 2, 4]
+    dropout: 0.1
+
+training:
+    batch_size: 4
+    epochs: 2
+    num_workers: 2
+    learning_rate: 0.0003
+    weight_decay: 0.01
+    amp: true
+    device: cuda
+    print_freq: 4
+
+inference:
+    batch_size: 4
+    device: cuda
+    field_order: tff
+    window_frames: 11

@@ -1,0 +1,48 @@
+seed: 1234
+
+paths:
+    dataset_dir: datasets/synthetic_voy_intro_luma_v1
+    output_dir: experiments/voy_intro_luma_v1
+
+data:
+    source_dirs:
+        - datasets/voy_intro_progressive_png
+    field_order: tff
+    window_frames: 11
+    height: 480
+    width: 760
+    num_workers: auto
+    train_samples: 2048
+    val_samples: 256
+    noise_std: 2.0
+    class_distribution:
+        film_phase_0: 0.13
+        film_phase_1: 0.13
+        film_phase_2: 0.13
+        film_phase_3: 0.13
+        film_phase_4: 0.13
+        video: 0.15
+        blend: 0.08
+        scene_cut: 0.06
+        unknown: 0.06
+
+model:
+    base_channels: 24
+    channel_mult: [1, 2, 4, 4]
+    dropout: 0.1
+
+training:
+    batch_size: 8
+    epochs: 12
+    num_workers: 8
+    learning_rate: 0.0003
+    weight_decay: 0.01
+    amp: true
+    device: cuda
+    print_freq: 50
+
+inference:
+    batch_size: 8
+    device: cuda
+    field_order: tff
+    window_frames: 11
