@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from trainner_ivtc.fields import frames_to_field_tensor, validate_field_order
+from trainner_ivtc.fields import FieldOrder, frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
 from trainner_ivtc.data.synthetic import CropBox, RandomCropSpec, SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
 
@@ -49,6 +49,9 @@ class CadenceFrameDataset(Dataset):
             self.records = [json.loads(line) for line in f if line.strip()]
         if not self.records:
             raise ValueError(f"Manifest contains no samples: {self.manifest_path}")
+
+    def set_epoch(self, epoch: int) -> None:
+        _ = int(epoch)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -99,8 +102,9 @@ class OnlineSyntheticCadenceDataset(Dataset):
         self.crop_width = int(data.get("crop_width", 0))
         self.crop_modulo = int(data.get("crop_modulo", 2))
         self.window_frames = int(data["window_frames"])
-        self.field_order = validate_field_order(str(data["field_order"]).lower())
-        self.noise_std = float(data.get("noise_std", 0.0))
+        self.field_order: FieldOrder = validate_field_order(str(data["field_order"]).lower())
+        self.augmentations = data.get("augmentations", {})
+        self.augmentations_enabled = split == "train"
         self.class_distribution = data["class_distribution"]
         self.resample_train_each_epoch = bool(data.get("resample_train_each_epoch", True))
         self.base_seed = int(config.get("seed", 1234)) + (0 if split == "train" else 100000000)
@@ -133,7 +137,7 @@ class OnlineSyntheticCadenceDataset(Dataset):
             source_crop = None
             sample_height = self.height
             sample_width = self.width
-        frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames, source_crop)
+        frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
         fields = frames_to_field_tensor(frames, self.field_order)
         return {
             "fields": torch.from_numpy(fields),

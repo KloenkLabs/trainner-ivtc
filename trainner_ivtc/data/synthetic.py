@@ -203,11 +203,44 @@ def make_procedural_clip(rng: np.random.Generator, height: int, width: int, moti
     return ProceduralClip(texture=texture, velocity_x=vx, velocity_y=vy, rectangles=rectangles)
 
 
-def add_noise(rng: np.random.Generator, fields: np.ndarray, noise_std: float) -> np.ndarray:
-    if noise_std <= 0:
-        return fields.astype(np.uint8)
-    noise = rng.normal(0.0, noise_std, size=fields.shape)
-    return np.clip(np.rint(fields.astype(np.float32) + noise), 0, 255).astype(np.uint8)
+def chance_applies(rng: np.random.Generator, chance: float) -> bool:
+    if chance <= 0.0:
+        return False
+    if chance >= 1.0:
+        return True
+    return bool(rng.random() < chance)
+
+
+def sample_range(rng: np.random.Generator, values: list[float]) -> float:
+    low = float(values[0])
+    high = float(values[1])
+    return low if low == high else float(rng.uniform(low, high))
+
+
+def apply_underexposure(frames: list[np.ndarray], factor: float) -> list[np.ndarray]:
+    return [np.clip(np.rint(frame.astype(np.float32) * factor), 0, 255).astype(np.uint8) for frame in frames]
+
+
+def apply_noise(rng: np.random.Generator, frames: list[np.ndarray], std: float) -> list[np.ndarray]:
+    if std <= 0.0:
+        return [frame.astype(np.uint8) for frame in frames]
+    noisy_frames = []
+    for frame in frames:
+        noise = rng.normal(0.0, std, size=frame.shape)
+        noisy_frames.append(np.clip(np.rint(frame.astype(np.float32) + noise), 0, 255).astype(np.uint8))
+    return noisy_frames
+
+
+def apply_window_augmentations(rng: np.random.Generator, frames: list[np.ndarray], augmentations: dict[str, Any] | None, enabled: bool) -> list[np.ndarray]:
+    if not enabled or not augmentations:
+        return [frame.astype(np.uint8) for frame in frames]
+    underexposure = augmentations.get("underexposure", {})
+    if chance_applies(rng, float(underexposure.get("chance", 0.0))):
+        frames = apply_underexposure(frames, sample_range(rng, underexposure.get("factor_range", [1.0, 1.0])))
+    noise = augmentations.get("noise", {})
+    if chance_applies(rng, float(noise.get("chance", 0.0))):
+        frames = apply_noise(rng, frames, sample_range(rng, noise.get("std_range", [0.0, 0.0])))
+    return [frame.astype(np.uint8) for frame in frames]
 
 
 def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
@@ -261,16 +294,16 @@ def generate_blend_window(rng: np.random.Generator, height: int, width: int, fie
     return frames_to_field_tensor(frames, field_order)
 
 
-def generate_unknown_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> list[np.ndarray]:
-    window_frames = validate_window_frames(window_frames)
-    clip = make_procedural_clip(rng, height, width, motion=False)
-    frame = clip.frame(0)
-    return [weave_field_pair(frame, frame, field_order) for _ in range(window_frames)]
-
-
-def generate_unknown_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> np.ndarray:
-    frames = generate_unknown_frames(rng, height, width, field_order, window_frames)
-    return frames_to_field_tensor(frames, field_order)
+# def generate_unknown_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> list[np.ndarray]:
+#     window_frames = validate_window_frames(window_frames)
+#     clip = make_procedural_clip(rng, height, width, motion=False)
+#     frame = clip.frame(0)
+#     return [weave_field_pair(frame, frame, field_order) for _ in range(window_frames)]
+#
+#
+# def generate_unknown_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> np.ndarray:
+#     frames = generate_unknown_frames(rng, height, width, field_order, window_frames)
+#     return frames_to_field_tensor(frames, field_order)
 
 
 def sample_class_index(rng: np.random.Generator, distribution: dict[str, float]) -> int:
@@ -295,7 +328,7 @@ def resolve_worker_count(value: Any = "auto") -> int:
     return workers
 
 
-def generate_sample_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, noise_std: float, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
+def generate_sample_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, augmentations: dict[str, Any] | None = None, augmentations_enabled: bool = True, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
     if label in range(5):
         frames = generate_telecine_frames(rng, height, width, label, field_order, source_pool, window_frames, source_crop)
     elif CLASS_NAMES[label] == "video":
@@ -303,18 +336,19 @@ def generate_sample_frames(rng: np.random.Generator, height: int, width: int, fi
     elif CLASS_NAMES[label] == "blend":
         frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     else:
-        frames = generate_unknown_frames(rng, height, width, field_order, window_frames)
-    return [add_noise(rng, frame, noise_std) for frame in frames]
+        # frames = generate_unknown_frames(rng, height, width, field_order, window_frames)
+        raise ValueError(f"Unsupported class label {label} ({CLASS_NAMES[label]}) for synthetic sample generation")
+    return apply_window_augmentations(rng, frames, augmentations, augmentations_enabled)
 
 
-def generate_sample(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, noise_std: float, window_frames: int = 11) -> np.ndarray:
-    frames = generate_sample_frames(rng, height, width, field_order, label, source_pool, noise_std, window_frames)
+def generate_sample(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, augmentations: dict[str, Any] | None = None, window_frames: int = 11) -> np.ndarray:
+    frames = generate_sample_frames(rng, height, width, field_order, label, source_pool, augmentations, True, window_frames)
     return frames_to_field_tensor(frames, field_order)
 
 
-def write_sample(dataset_dir: Path, split: str, index: int, seed: int, label: int, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool, noise_std: float, window_frames: int) -> dict[str, Any]:
+def write_sample(dataset_dir: Path, split: str, index: int, seed: int, label: int, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool, augmentations: dict[str, Any], augmentations_enabled: bool, window_frames: int) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
-    frames = generate_sample_frames(rng, height, width, field_order, label, source_pool, noise_std, window_frames)
+    frames = generate_sample_frames(rng, height, width, field_order, label, source_pool, augmentations, augmentations_enabled, window_frames)
     sample_dir_rel = f"{split}/{index:06d}"
     frame_paths = []
     for frame_index, frame in enumerate(frames):
@@ -338,13 +372,14 @@ def write_split(config: dict[str, Any], split: str, count: int, rng: np.random.G
     window_frames = validate_window_frames(int(config["data"]["window_frames"]))
     field_order = validate_field_order(str(config["data"]["field_order"]).lower())
     distribution = config["data"]["class_distribution"]
-    noise_std = float(config["data"].get("noise_std", 0.0))
+    augmentations = config["data"].get("augmentations", {})
+    augmentations_enabled = split == "train"
     labels = [sample_class_index(rng, distribution) for _ in range(count)]
     seeds = [int(rng.integers(0, 2**31 - 1)) for _ in range(count)]
     with manifest_path.open("w", encoding="utf-8") as manifest:
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             records = executor.map(
-                lambda args: write_sample(dataset_dir, split, args[0], args[1], args[2], height, width, field_order, source_pool, noise_std, window_frames),
+                lambda args: write_sample(dataset_dir, split, args[0], args[1], args[2], height, width, field_order, source_pool, augmentations, augmentations_enabled, window_frames),
                 zip(range(count), seeds, labels, strict=True),
             )
             for record in records:

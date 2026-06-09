@@ -63,6 +63,7 @@ Dataset split and sizing are source-frame based:
 - Online training can random-crop each generated sample with `crop_height`, `crop_width`, and `crop_modulo`.
 - Cropping is applied once per temporal window before field splitting, so every frame in the sample uses the same crop.
 - Crop bounds are deterministic from the sample seed and epoch, and train samples use new crops each epoch when `resample_train_each_epoch` is enabled.
+- Training-only augmentations are configured under `data.augmentations`, with independent per-window `chance` values.
 
 The generator currently applies these data variations:
 
@@ -72,7 +73,8 @@ The generator currently applies these data variations:
 - Source-frame blend samples by blending two telecined windows with a random alpha.
 - Progressive/PsF `video` samples that keep source frames unchanged.
 - Procedural unknown samples with static or low-motion content.
-- Optional Gaussian noise through `noise_std`.
+- Optional Gaussian noise with a configurable `std_range`.
+- Optional under-exposure by multiplying all frames in a window by a sampled darkening factor.
 - Optional online-only random crop with modulo-aligned crop bounds.
 
 Important caveat: procedural `unknown` samples may look like noise or moving synthetic patterns and may contain no recognizable source image. That is data generation behavior, not model dropout. Dropout is only applied inside the model during training.

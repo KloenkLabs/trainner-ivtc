@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from trainner_ivtc.config import load_config, save_config
 from trainner_ivtc.dataset import CadenceFrameDataset, OnlineSyntheticCadenceDataset, manifest_path
+from trainner_ivtc.image_io import save_luma_image
 from trainner_ivtc.labels import CLASS_NAMES
 from trainner_ivtc.metrics import active_class_indices_from_distribution, summarize_class_matches, summarize_classification
 from trainner_ivtc.model import build_model
@@ -27,7 +28,11 @@ LOGGER_NAME = "trainner_ivtc.train"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the global luma cadence classifier.")
     parser.add_argument("--config", required=True, help="Path to a YAML config.")
-    return parser.parse_args()
+    parser.add_argument("--dump-otf-val", type=int, default=0, help="Dump up to N augmented online training windows as horizontal JPG strips in output_dir/otf_val. 0 disables dumping.")
+    args = parser.parse_args()
+    if args.dump_otf_val < 0:
+        parser.error("--dump-otf-val must be >= 0")
+    return args
 
 
 def seed_everything(seed: int) -> None:
@@ -63,6 +68,51 @@ def prepare_fields(fields: torch.Tensor, device: torch.device) -> torch.Tensor:
     if fields.dtype == torch.uint8:
         return fields.float().div_(255.0)
     return fields.float()
+
+
+def field_tensor_to_luma_strip(fields: torch.Tensor, field_order: str) -> np.ndarray:
+    fields = fields.detach().cpu()
+    if fields.dtype == torch.uint8:
+        field_array = fields.numpy()
+    else:
+        field_array = fields.float().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).numpy()
+    if field_array.ndim != 3 or field_array.shape[0] % 2 != 0:
+        raise ValueError(f"Expected field tensor with shape (2 * window_frames, height, width), got {tuple(field_array.shape)}")
+    frames = []
+    for field_index in range(0, field_array.shape[0], 2):
+        first = field_array[field_index]
+        second = field_array[field_index + 1]
+        frame = np.empty((first.shape[0] * 2, first.shape[1]), dtype=np.uint8)
+        # Rebuild the original interlaced frame from fields stored in field-order sequence.
+        if field_order == "tff":
+            frame[0::2, :] = first
+            frame[1::2, :] = second
+        else:
+            frame[1::2, :] = first
+            frame[0::2, :] = second
+        frames.append(frame)
+    return np.concatenate(frames, axis=1)
+
+
+def safe_label_name(label: int) -> str:
+    name = CLASS_NAMES[label] if 0 <= label < len(CLASS_NAMES) else f"label_{label}"
+    return "".join(char if char.isalnum() else "_" for char in name)
+
+
+def dump_otf_val_windows(batch: dict[str, torch.Tensor], output_dir: Path, field_order: str, max_count: int, dumped_count: int, epoch: int, step: int) -> int:
+    if max_count <= 0 or dumped_count >= max_count:
+        return dumped_count
+    dump_dir = output_dir / "otf_val"
+    fields = batch["fields"]
+    labels = batch["label"]
+    for batch_index in range(int(fields.shape[0])):
+        if dumped_count >= max_count:
+            break
+        label = int(labels[batch_index])
+        image = field_tensor_to_luma_strip(fields[batch_index], field_order)
+        dumped_count += 1
+        save_luma_image(dump_dir / f"{dumped_count:06d}_epoch{epoch:03d}_step{step:06d}_label_{safe_label_name(label)}.jpg", image)
+    return dumped_count
 
 
 def format_duration(seconds: float) -> str:
@@ -132,7 +182,7 @@ def save_checkpoint(path: Path, model: nn.Module, config: dict[str, Any], epoch:
     )
 
 
-def train(config: dict[str, Any]) -> None:
+def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
     seed_everything(int(config.get("seed", 1234)))
     dataset_dir = Path(config["paths"]["dataset_dir"])
     output_dir = Path(config["paths"]["output_dir"])
@@ -162,17 +212,21 @@ def train(config: dict[str, Any]) -> None:
     scaler = GradScaler(device="cuda", enabled=amp and device.type == "cuda")
     active_class_indices = active_class_indices_from_distribution(config["data"]["class_distribution"])
     active_class_names = [CLASS_NAMES[i] for i in active_class_indices]
+    field_order = str(config["data"]["field_order"])
     best_macro_f1 = -1.0
     best_checkpoint_path = output_dir / "checkpoints" / "best.pt"
     last_checkpoint_path = output_dir / "checkpoints" / "last.pt"
     total_iters = 0
+    dumped_otf_val = 0
     start_time = time.perf_counter()
     final_metrics: dict[str, Any] | None = None
     logger.info("Starting training: train_samples=%d val_samples=%d epochs=%d batch_size=%d window_frames=%d", len(train_dataset), len(val_dataset), int(training["epochs"]), int(training["batch_size"]), int(config["data"]["window_frames"]))
-    logger.info("Augmentation: noise_std=%.3f class_distribution=%s", float(config["data"].get("noise_std", 0.0)), json.dumps(config["data"].get("class_distribution", {}), separators=(",", ":")))
+    logger.info("Augmentation: augmentations=%s class_distribution=%s", json.dumps(config["data"].get("augmentations", {}), separators=(",", ":")), json.dumps(config["data"].get("class_distribution", {}), separators=(",", ":")))
     logger.info("Macro F1 active classes: %s", ",".join(active_class_names))
+    if dump_otf_val > 0:
+        logger.info("Dumping up to %d augmented training windows to %s", dump_otf_val, output_dir / "otf_val")
     for epoch in range(1, int(training["epochs"]) + 1):
-        if hasattr(train_dataset, "set_epoch"):
+        if isinstance(train_dataset, OnlineSyntheticCadenceDataset):
             train_dataset.set_epoch(epoch)
         model.train()
         running_loss = 0.0
@@ -188,6 +242,7 @@ def train(config: dict[str, Any]) -> None:
             recent_data_wait += batch_ready_time - wait_start_time
             step_start_time = batch_ready_time
             total_iters += 1
+            dumped_otf_val = dump_otf_val_windows(batch, output_dir, field_order, dump_otf_val, dumped_otf_val, epoch, step)
             fields = prepare_fields(batch["fields"], device)
             targets = batch["label"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -238,12 +293,14 @@ def train(config: dict[str, Any]) -> None:
         logger.info("Least correctly matched classes: %s", format_class_match_summary(least_matched))
     logger.info("Best checkpoint (macro_f1=%.4f) saved to %s", best_macro_f1, best_checkpoint_path)
     logger.info("Last checkpoint (macro_f1=%.4f) saved to %s", final_macro_f1, last_checkpoint_path)
+    if dump_otf_val > 0:
+        logger.info("Dumped %d augmented training window JPGs to %s", dumped_otf_val, output_dir / "otf_val")
     logger.info("Log was written to %s", log_path)
 
 
 def main() -> None:
     args = parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config), dump_otf_val=int(args.dump_otf_val))
 
 
 if __name__ == "__main__":

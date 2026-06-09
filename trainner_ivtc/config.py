@@ -43,7 +43,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "blend": 0.08,
             "unknown": 0.06,
         },
-        "noise_std": 2.0,
+        "augmentations": {
+            "noise": {
+                "chance": 1.0,
+                "std_range": [2.0, 2.0],
+            },
+            "underexposure": {
+                "chance": 0.0,
+                "factor_range": [0.55, 0.90],
+            },
+        },
     },
     "model": {
         "base_channels": 32,
@@ -66,6 +75,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device": "cuda",
         "field_order": "tff",
         "window_frames": 11,
+        "num_workers": 4,
+        "prefetch_factor": 2,
     },
 }
 
@@ -130,6 +141,52 @@ def resolve_native_dimensions(config: dict[str, Any], config_path: Path, crop_he
     data["width"] = resolved_size[1]
 
 
+def validate_chance(value: Any, name: str, config_path: Path) -> float:
+    chance = float(value)
+    if chance < 0.0 or chance > 1.0:
+        raise ValueError(f"{config_path}: {name} must be between 0.0 and 1.0")
+    return chance
+
+
+def validate_range(value: Any, name: str, config_path: Path, minimum: float, maximum: float | None = None) -> list[float]:
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        raise ValueError(f"{config_path}: {name} must contain exactly two numeric values")
+    low = float(value[0])
+    high = float(value[1])
+    if low > high:
+        raise ValueError(f"{config_path}: {name} minimum must be <= maximum")
+    if low < minimum or high < minimum:
+        raise ValueError(f"{config_path}: {name} values must be >= {minimum}")
+    if maximum is not None and (low > maximum or high > maximum):
+        raise ValueError(f"{config_path}: {name} values must be <= {maximum}")
+    return [low, high]
+
+
+def validate_augmentations_config(config: dict[str, Any], config_path: Path) -> None:
+    data = config["data"]
+    augmentations = data.get("augmentations", {})
+    if augmentations is None:
+        augmentations = {}
+    if not isinstance(augmentations, dict):
+        raise ValueError(f"{config_path}: data.augmentations must be a mapping")
+    noise = augmentations.get("noise", {})
+    underexposure = augmentations.get("underexposure", {})
+    if not isinstance(noise, dict):
+        raise ValueError(f"{config_path}: data.augmentations.noise must be a mapping")
+    if not isinstance(underexposure, dict):
+        raise ValueError(f"{config_path}: data.augmentations.underexposure must be a mapping")
+    data["augmentations"] = {
+        "noise": {
+            "chance": validate_chance(noise.get("chance", 0.0), "data.augmentations.noise.chance", config_path),
+            "std_range": validate_range(noise.get("std_range", [0.0, 0.0]), "data.augmentations.noise.std_range", config_path, 0.0),
+        },
+        "underexposure": {
+            "chance": validate_chance(underexposure.get("chance", 0.0), "data.augmentations.underexposure.chance", config_path),
+            "factor_range": validate_range(underexposure.get("factor_range", [0.55, 0.90]), "data.augmentations.underexposure.factor_range", config_path, 0.0, 1.0),
+        },
+    }
+
+
 def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data = config["data"]
     dataset_mode = str(data.get("dataset_mode", "online"))
@@ -175,6 +232,7 @@ def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data["crop_height"] = crop_height
     data["crop_width"] = crop_width
     data["crop_modulo"] = crop_modulo
+    validate_augmentations_config(config, config_path)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:

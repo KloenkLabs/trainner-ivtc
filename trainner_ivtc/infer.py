@@ -5,13 +5,14 @@ import json
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 from trainner_ivtc.fields import FieldOrder, clamped_window_indices, frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import iter_image_paths, load_luma_image
@@ -26,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output JSONL path.")
     parser.add_argument("--field-order", choices=["tff", "bff"], default=None, help="Override checkpoint/config field order.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override inference batch size.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Override inference data loader workers.")
+    parser.add_argument("--prefetch-factor", type=int, default=None, help="Override inference data loader prefetch factor.")
     parser.add_argument("--device", default=None, help="Override inference device.")
     return parser.parse_args()
 
@@ -54,6 +57,51 @@ def make_window_tensor(load_frame: Callable[[int], np.ndarray], total_frames: in
     if any(frame.shape != shape for frame in frames):
         raise ValueError("All inference frames must have the same dimensions")
     return frames_to_field_tensor(frames, field_order).astype(np.float32) / 255.0
+
+
+class InferenceFrameDataset(Dataset):
+    def __init__(self, paths: list[Path], window_frames: int, field_order: FieldOrder, cache_size: int) -> None:
+        self.paths = paths
+        self.window_frames = window_frames
+        self.field_order: FieldOrder = field_order
+        self.cache_size = max(0, cache_size)
+        self.frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def load_cached(self, index: int) -> np.ndarray:
+        if self.cache_size == 0:
+            return load_luma_image(self.paths[index])
+        cached = self.frame_cache.get(index)
+        if cached is not None:
+            self.frame_cache.move_to_end(index)
+            return cached
+        frame = load_luma_image(self.paths[index])
+        self.frame_cache[index] = frame
+        if len(self.frame_cache) > self.cache_size:
+            self.frame_cache.popitem(last=False)
+        return frame
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        fields = make_window_tensor(self.load_cached, len(self.paths), index, self.window_frames, self.field_order)
+        return {
+            "fields": torch.from_numpy(fields),
+            "frame_index": int(index),
+        }
+
+
+def make_inference_loader(dataset: Dataset, batch_size: int, num_workers: int, prefetch_factor: int, device: torch.device) -> DataLoader:
+    kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **kwargs)
 
 
 def is_numbered_png_frame(path: Path) -> bool:
@@ -94,36 +142,52 @@ def resolve_input_paths(input_path: str | Path) -> list[Path]:
     return paths
 
 
-def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_path: str | Path, field_order_override: str | None = None, batch_size_override: int | None = None, device_override: str | None = None) -> None:
+def run_inference(
+    checkpoint_path: str | Path,
+    input_dir: str | Path,
+    output_path: str | Path,
+    field_order_override: str | None = None,
+    batch_size_override: int | None = None,
+    device_override: str | None = None,
+    num_workers_override: int | None = None,
+    prefetch_factor_override: int | None = None,
+) -> None:
     start_time = time.perf_counter()
     device = resolve_device(device_override)
     model, checkpoint = load_checkpoint_model(checkpoint_path, device)
     config = checkpoint.get("config", {})
     inference_config = config.get("inference", {})
     window_frames = int(checkpoint.get("window_frames", inference_config.get("window_frames", 11)))
-    field_order = validate_field_order((field_order_override or checkpoint.get("field_order") or inference_config.get("field_order", "tff")).lower())
-    batch_size = int(batch_size_override or inference_config.get("batch_size", 16))
+    field_order_raw = str(field_order_override or checkpoint.get("field_order") or inference_config.get("field_order", "tff")).lower()
+    field_order: FieldOrder = validate_field_order(field_order_raw)
+    batch_size = int(batch_size_override if batch_size_override is not None else inference_config.get("batch_size", 16))
+    num_workers = int(num_workers_override if num_workers_override is not None else inference_config.get("num_workers", 8))
+    prefetch_factor = int(prefetch_factor_override if prefetch_factor_override is not None else inference_config.get("prefetch_factor", 2))
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    if num_workers < 0:
+        raise ValueError(f"num_workers must be >= 0, got {num_workers}")
+    if prefetch_factor < 1:
+        raise ValueError(f"prefetch_factor must be >= 1, got {prefetch_factor}")
     paths = resolve_input_paths(input_dir)
     total_batches = (len(paths) + batch_size - 1) // batch_size
     progress_freq = max(1, total_batches // 20)
-    print(f"Starting inference: frames={len(paths)} batches={total_batches} batch_size={batch_size} device={device} field_order={field_order} window_frames={window_frames}", flush=True)
-
-    @lru_cache(maxsize=max(256, window_frames * batch_size * 2))
-    def load_cached(index: int) -> np.ndarray:
-        return load_luma_image(paths[index])
+    cache_size = max(256, window_frames * batch_size * 2)
+    dataset = InferenceFrameDataset(paths, window_frames, field_order, cache_size)
+    loader = make_inference_loader(dataset, batch_size, num_workers, prefetch_factor, device)
+    print(f"Starting inference: frames={len(paths)} batches={total_batches} batch_size={batch_size} num_workers={num_workers} prefetch_factor={prefetch_factor} device={device} field_order={field_order} window_frames={window_frames}", flush=True)
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f, torch.inference_mode():
-        for batch_index, start in enumerate(range(0, len(paths), batch_size), start=1):
-            frame_indices = list(range(start, min(start + batch_size, len(paths))))
-            batch = np.stack([make_window_tensor(load_cached, len(paths), frame_index, window_frames, field_order) for frame_index in frame_indices], axis=0)
-            tensor = torch.from_numpy(batch).to(device, non_blocking=True)
+        for batch_index, batch in enumerate(loader, start=1):
+            tensor = batch["fields"].to(device, non_blocking=True)
             logits = model(tensor)
             probabilities = torch.softmax(logits.float(), dim=1).cpu()
+            frame_indices = [int(frame_index) for frame_index in batch["frame_index"].tolist()]
             for frame_index, probs in zip(frame_indices, probabilities, strict=False):
                 f.write(json.dumps(prediction_to_json(frame_index, probs), separators=(",", ":")) + "\n")
             if batch_index == 1 or batch_index == total_batches or batch_index % progress_freq == 0:
-                processed = min(start + batch_size, len(paths))
+                processed = min(batch_index * batch_size, len(paths))
                 elapsed = time.perf_counter() - start_time
                 fps = processed / elapsed if elapsed > 0 else 0.0
                 print(f"inference batch={batch_index}/{total_batches} frames={processed}/{len(paths)} fps={fps:.2f}", flush=True)
@@ -134,7 +198,7 @@ def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_pat
 
 def main() -> None:
     args = parse_args()
-    run_inference(args.checkpoint, args.input, args.output, args.field_order, args.batch_size, args.device)
+    run_inference(args.checkpoint, args.input, args.output, args.field_order, args.batch_size, args.device, args.num_workers, args.prefetch_factor)
 
 
 if __name__ == "__main__":
