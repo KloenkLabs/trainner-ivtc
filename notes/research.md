@@ -6,6 +6,8 @@ The first useful baseline is a global luma cadence classifier trained only on sy
 
 Validation is used during training after every epoch to compute metrics and choose `best.pt`. It is not used for gradient updates and there is no early stopping yet.
 
+The data pipeline now supports online synthetic generation. This should simplify training and avoid generated sample-folder I/O, but training speed should be re-measured because CPU generation and PNG decode throughput may become the bottleneck.
+
 ## Source Data
 
 The first larger source sequence is `datasets/voy_intro_progressive_png`.
@@ -140,4 +142,4 @@ Current data risks:
 - `scene_cut` and `unknown` should probably gain source-based variants.
 - True-video examples should eventually come from real or better synthesized 29.97i/29.97p material.
 - The validation set is synthetic and may overstate usefulness on real mixed-content DVD footage.
-
+- Previous sweep results used materialized synthetic datasets; online-mode performance and best hyperparameters need a new benchmark.

@@ -12,10 +12,10 @@ import numpy as np
 import torch
 from torch import nn
 from torch.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from trainner_ivtc.config import load_config, save_config
-from trainner_ivtc.dataset import CadenceFrameDataset, manifest_path
+from trainner_ivtc.dataset import CadenceFrameDataset, OnlineSyntheticCadenceDataset, manifest_path
 from trainner_ivtc.labels import CLASS_NAMES
 from trainner_ivtc.metrics import summarize_classification
 from trainner_ivtc.model import build_model
@@ -44,8 +44,8 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def make_loader(dataset: CadenceFrameDataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=torch.cuda.is_available(), drop_last=shuffle)
+def make_loader(dataset: Dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=torch.cuda.is_available(), drop_last=shuffle, persistent_workers=num_workers > 0)
 
 
 def format_duration(seconds: float) -> str:
@@ -114,13 +114,18 @@ def train(config: dict[str, Any]) -> None:
     dataset_dir = Path(config["paths"]["dataset_dir"])
     output_dir = Path(config["paths"]["output_dir"])
     logger, log_path = setup_logger(output_dir)
-    train_manifest = manifest_path(dataset_dir, "train")
-    val_manifest = manifest_path(dataset_dir, "val")
-    if not train_manifest.exists() or not val_manifest.exists():
-        raise FileNotFoundError(f"Missing synthetic manifests in {dataset_dir}. Run python -m trainner_ivtc.data.make_synthetic --config {config['config_path']} first.")
     save_config(config, output_dir / "config_resolved.yaml")
-    train_dataset = CadenceFrameDataset(train_manifest)
-    val_dataset = CadenceFrameDataset(val_manifest)
+    dataset_mode = str(config["data"].get("dataset_mode", "online"))
+    if dataset_mode == "manifest":
+        train_manifest = manifest_path(dataset_dir, "train")
+        val_manifest = manifest_path(dataset_dir, "val")
+        if not train_manifest.exists() or not val_manifest.exists():
+            raise FileNotFoundError(f"Missing synthetic manifests in {dataset_dir}. Run python -m trainner_ivtc.data.make_synthetic --config {config['config_path']} first.")
+        train_dataset = CadenceFrameDataset(train_manifest)
+        val_dataset = CadenceFrameDataset(val_manifest)
+    else:
+        train_dataset = OnlineSyntheticCadenceDataset(config, "train")
+        val_dataset = OnlineSyntheticCadenceDataset(config, "val")
     training = config["training"]
     device = resolve_device(str(training.get("device", "cuda")))
     amp = bool(training.get("amp", True))
@@ -138,6 +143,8 @@ def train(config: dict[str, Any]) -> None:
     final_metrics: dict[str, Any] | None = None
     logger.info("Starting training: train_samples=%d val_samples=%d epochs=%d batch_size=%d device=%s amp=%s", len(train_dataset), len(val_dataset), int(training["epochs"]), int(training["batch_size"]), device, amp and device.type == "cuda")
     for epoch in range(1, int(training["epochs"]) + 1):
+        if hasattr(train_dataset, "set_epoch"):
+            train_dataset.set_epoch(epoch)
         model.train()
         running_loss = 0.0
         for step, batch in enumerate(train_loader, start=1):

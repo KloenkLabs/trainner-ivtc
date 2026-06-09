@@ -5,15 +5,18 @@ paths:
     output_dir: experiments/voy_intro_luma_v1
 
 data:
+    dataset_mode: online
     source_dirs:
         - datasets/voy_intro_progressive_png
     field_order: tff
     window_frames: 11
-    height: 480
-    width: 760
+    height: 0
+    width: 0
     num_workers: auto
-    train_samples: 2048
-    val_samples: 256
+    train_samples_pct: 90
+    val_samples_pct: 10
+    source_cache_size: 256
+    resample_train_each_epoch: true
     noise_std: 2.0
     class_distribution:
         film_phase_0: 0.13
@@ -39,7 +42,7 @@ training:
     weight_decay: 0.01
     amp: true
     device: cuda
-    print_freq: 50
+    print_freq: 100
 
 inference:
     batch_size: 8

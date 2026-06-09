@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from multiprocessing import Value
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from torch.utils.data import Dataset
 
 from trainner_ivtc.fields import frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
+from trainner_ivtc.data.synthetic import SourceFramePool, count_sequence_frames, generate_sample, sample_class_index, split_source_sequences
 
 
 class CadenceFrameDataset(Dataset):
@@ -47,6 +49,54 @@ class CadenceFrameDataset(Dataset):
 
 
 CadenceNpzDataset = CadenceFrameDataset
+
+
+class OnlineSyntheticCadenceDataset(Dataset):
+    def __init__(self, config: dict[str, Any], split: str) -> None:
+        if split not in {"train", "val"}:
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+        self.config = config
+        self.split = split
+        self.shared_epoch = Value("i", 0)
+        data = config["data"]
+        train_sequences, val_sequences = split_source_sequences([str(path) for path in data.get("source_dirs", [])], int(data["train_samples_pct"]))
+        sequences = train_sequences if split == "train" else val_sequences
+        self.length = count_sequence_frames(sequences)
+        if self.length <= 0:
+            raise ValueError(f"Online synthetic {split} split has no source frames")
+        self.height = int(data["height"])
+        self.width = int(data["width"])
+        self.window_frames = int(data["window_frames"])
+        self.field_order = validate_field_order(str(data["field_order"]).lower())
+        self.noise_std = float(data.get("noise_std", 0.0))
+        self.class_distribution = data["class_distribution"]
+        self.resample_train_each_epoch = bool(data.get("resample_train_each_epoch", True))
+        self.base_seed = int(config.get("seed", 1234)) + (0 if split == "train" else 100000000)
+        self.source_pool = SourceFramePool(None, self.height, self.width, sequences, int(data.get("source_cache_size", 256)))
+
+    def __len__(self) -> int:
+        return self.length
+
+    def set_epoch(self, epoch: int) -> None:
+        with self.shared_epoch.get_lock():
+            self.shared_epoch.value = int(epoch)
+
+    def sample_seed(self, index: int) -> int:
+        with self.shared_epoch.get_lock():
+            current_epoch = int(self.shared_epoch.value)
+        epoch = current_epoch if self.split == "train" and self.resample_train_each_epoch else 0
+        return int((self.base_seed + index * 1009 + epoch * 1000003) % (2**31 - 1))
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        rng = np.random.default_rng(self.sample_seed(index))
+        label = sample_class_index(rng, self.class_distribution)
+        fields = generate_sample(rng, self.height, self.width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames).astype(np.float32) / 255.0
+        return {
+            "fields": torch.from_numpy(fields),
+            "label": torch.tensor(label, dtype=torch.long),
+            "frame_index": int(index),
+            "sample_path": f"online:{self.split}:{index}",
+        }
 
 
 def manifest_path(dataset_dir: str | Path, split: str) -> Path:

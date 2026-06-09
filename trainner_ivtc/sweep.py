@@ -64,7 +64,7 @@ def main() -> None:
     for window_frames in (7, 11, 15):
         dataset_config = build_config(base, sweep_root, window_frames, 8, 8)
         dataset_dir = Path(dataset_config["paths"]["dataset_dir"])
-        if args.overwrite_datasets or not dataset_ready(dataset_dir):
+        if str(dataset_config["data"].get("dataset_mode", "online")) == "manifest" and (args.overwrite_datasets or not dataset_ready(dataset_dir)):
             make_synthetic_dataset(dataset_config, overwrite=args.overwrite_datasets, num_workers=args.workers)
         for batch_size in (4, 8, 16):
             for epochs in (8, 12, 16):

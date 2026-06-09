@@ -8,7 +8,7 @@ The model does not reconstruct progressive frames and does not perform IVTC itse
 
 The v1 scope is intentionally narrow:
 
-- Input: progressive PNG source frames for synthetic generation, or pre-extracted frame sequences for inference.
+- Input: progressive PNG source frames for online synthetic training or materialized synthetic generation, plus pre-extracted frame sequences for inference.
 - Internal model input: luma fields shaped as `[B, window_frames * 2, H / 2, W]`.
 - Output: one global cadence class per target frame/window.
 - Deferred: patch-grid cadence maps, local field matching, RGB/chroma features, ONNX export, VapourSynth integration, and mixed-cadence region reconstruction.
@@ -50,7 +50,15 @@ Inference derives `film_confidence`, `video_confidence`, class probabilities, an
 
 Synthetic data is generated from alphabetically sorted progressive PNG frame sequences. No naming scheme is enforced; file order is based on filename sorting.
 
-Generated samples are written as inspectable PNG frame folders plus JSONL manifests. Each manifest row points to a sample directory and records its class label, field order, frame list, and target frame index.
+Training now defaults to online synthetic generation, where the PyTorch dataset creates each sample in memory and returns the field tensor directly. The materialized `make_synthetic` path remains available for debugging and writes inspectable PNG frame folders plus JSONL manifests. Each manifest row points to a sample directory and records its class label, field order, frame list, and target frame index.
+
+Dataset split and sizing are source-frame based:
+
+- `train_samples_pct` and `val_samples_pct` split each alphabetically sorted source sequence into train and validation ranges.
+- Defaults are `90` and `10`.
+- Source-based train and validation samples do not draw from the same source-frame range.
+- If both `height` and `width` are `0`, the config resolves native dimensions from the source images.
+- A bounded per-worker LRU source-frame cache is controlled by `source_cache_size`.
 
 The generator currently applies these data variations:
 
@@ -83,11 +91,11 @@ Optional worker override:
 python -m trainner_ivtc.data.make_synthetic --config configs/voy_intro_luma_v1.yaml --workers 8
 ```
 
-By default, `data.num_workers: auto` uses the system CPU core count. Generation is multithreaded and keeps manifest order deterministic.
+By default, `data.num_workers: auto` uses the system CPU core count. Generation is multithreaded and keeps manifest order deterministic. `make_synthetic` uses the same percentage split and native dimension resolution as online training.
 
 ### `trainner_ivtc.train`
 
-Trains the global classifier from a generated dataset manifest.
+Trains the global classifier. With `data.dataset_mode: online`, training reads source PNGs and generates synthetic samples on the fly. With `data.dataset_mode: manifest`, training reads a generated dataset manifest.
 
 Example:
 
@@ -95,7 +103,7 @@ Example:
 python -m trainner_ivtc.train --config configs/voy_intro_luma_v1.yaml
 ```
 
-Training logs compact progress to the terminal. JSON metrics and detailed messages are written to `train.log` in the experiment output directory. The trainer validates after each epoch, writes `last.pt`, and updates `best.pt` when validation macro F1 improves.
+Training logs compact progress to the terminal. JSON metrics and detailed messages are written to `train.log` in the experiment output directory. The trainer validates after each epoch, writes `last.pt`, and updates `best.pt` when validation macro F1 improves. Online training resamples train samples each epoch while keeping validation fixed.
 
 ### `trainner_ivtc.infer`
 
@@ -120,4 +128,3 @@ python -m trainner_ivtc.sweep --base-config configs/voy_intro_luma_v1.yaml --swe
 ```
 
 The sweep creates per-window datasets, per-combination configs, per-run experiment folders, and summary files at `results.json` and `results.csv`.
-

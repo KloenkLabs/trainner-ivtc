@@ -5,15 +5,18 @@ paths:
     output_dir: experiments/global_luma_v1_test
 
 data:
+    dataset_mode: online
     source_dirs:
         - datasets/gt_test1
     field_order: tff
     window_frames: 11
-    height: 400
-    width: 640
+    height: 0
+    width: 0
     num_workers: auto
-    train_samples: 32
-    val_samples: 8
+    train_samples_pct: 90
+    val_samples_pct: 10
+    source_cache_size: 128
+    resample_train_each_epoch: true
     noise_std: 2.0
     class_distribution:
         film_phase_0: 0.13
