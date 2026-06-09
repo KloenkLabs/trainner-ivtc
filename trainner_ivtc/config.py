@@ -95,7 +95,7 @@ def reject_removed_data_keys(loaded: dict[str, Any], config_path: Path) -> None:
         raise ValueError(f"{config_path}: data.{removed[0]} was replaced by data.{removed[0]}_pct. Use integer percentages, usually train_samples_pct: 90 and val_samples_pct: 10.")
 
 
-def resolve_native_dimensions(config: dict[str, Any], config_path: Path) -> None:
+def resolve_native_dimensions(config: dict[str, Any], config_path: Path, crop_height: int, crop_width: int) -> None:
     data = config["data"]
     height = int(data["height"])
     width = int(data["width"])
@@ -110,6 +110,13 @@ def resolve_native_dimensions(config: dict[str, Any], config_path: Path) -> None
     source_dirs = [str(path) for path in data.get("source_dirs", [])]
     if not source_dirs:
         raise ValueError(f"{config_path}: data.height and data.width are 0, but data.source_dirs is empty")
+    if crop_height > 0:
+        for source_dir in source_dirs:
+            paths = iter_image_paths(source_dir)
+            current_size = image_size(paths[0])
+            if crop_height > current_size[0] or crop_width > current_size[1]:
+                raise ValueError(f"{config_path}: crop size {crop_height}x{crop_width} cannot exceed first source image size {current_size[0]}x{current_size[1]} in {source_dir}")
+        return
     resolved_size: tuple[int, int] | None = None
     for source_dir in source_dirs:
         paths = iter_image_paths(source_dir)
@@ -147,7 +154,6 @@ def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data["source_cache_size"] = int(data.get("source_cache_size", 256))
     if data["source_cache_size"] < 0:
         raise ValueError(f"{config_path}: data.source_cache_size must be >= 0")
-    resolve_native_dimensions(config, config_path)
     crop_height = int(data.get("crop_height", 0))
     crop_width = int(data.get("crop_width", 0))
     crop_modulo = int(data.get("crop_modulo", 2))
@@ -158,12 +164,14 @@ def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     if crop_height < 0 or crop_width < 0:
         raise ValueError(f"{config_path}: data.crop_height and data.crop_width must be >= 0")
     if crop_height > 0:
-        if crop_height > int(data["height"]) or crop_width > int(data["width"]):
-            raise ValueError(f"{config_path}: crop size {crop_height}x{crop_width} cannot exceed source size {data['height']}x{data['width']}")
         if crop_height % 2 != 0 or crop_width % 2 != 0:
             raise ValueError(f"{config_path}: data.crop_height and data.crop_width must be even")
         if crop_height % crop_modulo != 0 or crop_width % crop_modulo != 0:
             raise ValueError(f"{config_path}: crop bounds must be divisible by data.crop_modulo, so crop_height and crop_width must also be divisible by it")
+    resolve_native_dimensions(config, config_path, crop_height, crop_width)
+    if crop_height > 0 and int(data["height"]) > 0:
+        if crop_height > int(data["height"]) or crop_width > int(data["width"]):
+            raise ValueError(f"{config_path}: crop size {crop_height}x{crop_width} cannot exceed source size {data['height']}x{data['width']}")
     data["crop_height"] = crop_height
     data["crop_width"] = crop_width
     data["crop_modulo"] = crop_modulo

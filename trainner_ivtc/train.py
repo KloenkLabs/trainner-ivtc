@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from trainner_ivtc.config import load_config, save_config
 from trainner_ivtc.dataset import CadenceFrameDataset, OnlineSyntheticCadenceDataset, manifest_path
 from trainner_ivtc.labels import CLASS_NAMES
-from trainner_ivtc.metrics import active_class_indices_from_distribution, summarize_classification
+from trainner_ivtc.metrics import active_class_indices_from_distribution, summarize_class_matches, summarize_classification
 from trainner_ivtc.model import build_model
 
 
@@ -71,6 +71,12 @@ def format_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours:d}:{minutes:02d}:{sec:02d}"
     return f"{minutes:d}:{sec:02d}"
+
+
+def format_class_match_summary(matches: list[dict[str, Any]]) -> str:
+    if not matches:
+        return "none"
+    return ", ".join(f"{row['class_name']} correct={int(row['correct'])}/{int(row['support'])} recall={float(row['recall']):.4f}" for row in matches)
 
 
 def setup_logger(output_dir: Path) -> tuple[logging.Logger, Path]:
@@ -224,6 +230,12 @@ def train(config: dict[str, Any]) -> None:
     final_accuracy = float(final_metrics["accuracy"]) if final_metrics is not None else 0.0
     final_macro_f1 = float(final_metrics["macro_f1"]) if final_metrics is not None else 0.0
     logger.info("Training complete:\n%d iters in %s - avg_it_s=%.2f  best_macro_f1=%.4f  final_accuracy=%.4f  final_macro_f1=%.4f", total_iters, format_duration(elapsed), avg_iter_per_second, best_macro_f1, final_accuracy, final_macro_f1)
+    if final_metrics is not None:
+        class_matches = summarize_class_matches(final_metrics, active_class_indices)
+        most_matched = sorted(class_matches, key=lambda row: (int(row["correct"]), float(row["recall"])), reverse=True)
+        least_matched = sorted(class_matches, key=lambda row: (int(row["correct"]), float(row["recall"])))
+        logger.info("Most correctly matched classes: %s", format_class_match_summary(most_matched))
+        logger.info("Least correctly matched classes: %s", format_class_match_summary(least_matched))
     logger.info("Best checkpoint (macro_f1=%.4f) saved to %s", best_macro_f1, best_checkpoint_path)
     logger.info("Last checkpoint (macro_f1=%.4f) saved to %s", final_macro_f1, last_checkpoint_path)
     logger.info("Log was written to %s", log_path)

@@ -28,6 +28,18 @@ def active_class_indices_from_distribution(distribution: dict[str, float], min_w
     return active_indices
 
 
+def summarize_class_matches(metrics: dict[str, Any], active_class_indices: tuple[int, ...] | None = None) -> list[dict[str, Any]]:
+    matrix = metrics["confusion_matrix"]
+    active_class_indices = active_class_indices if active_class_indices is not None else tuple(range(len(CLASS_NAMES)))
+    matches: list[dict[str, Any]] = []
+    for i in active_class_indices:
+        row = matrix[i]
+        support = int(sum(int(value) for value in row))
+        correct = int(row[i])
+        matches.append({"class_name": CLASS_NAMES[i], "correct": correct, "support": support, "recall": correct / support if support > 0 else 0.0})
+    return matches
+
+
 def summarize_classification(logits: Tensor, targets: Tensor, active_class_indices: tuple[int, ...] | None = None) -> dict[str, Any]:
     probabilities = torch.softmax(logits.float(), dim=1)
     predictions = torch.argmax(probabilities, dim=1)

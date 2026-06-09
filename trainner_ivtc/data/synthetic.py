@@ -22,6 +22,17 @@ from trainner_ivtc.labels import CLASS_NAMES, CLASS_TO_INDEX, class_id
 CropBox = tuple[int, int, int, int]
 
 
+@dataclass(frozen=True)
+class RandomCropSpec:
+    height: int
+    width: int
+    modulo: int
+    seed: int
+
+
+SourceCrop = CropBox | RandomCropSpec
+
+
 @dataclass
 class ProceduralClip:
     texture: np.ndarray
@@ -45,10 +56,12 @@ class SourceFramePool:
     def __init__(self, source_dirs: list[str] | None, height: int, width: int, sequences: list[list[Path]] | None = None, cache_size: int = 0, cache_mode: str = "lru") -> None:
         self.height = height
         self.width = width
+        self.resize_size = (height, width) if height > 0 and width > 0 else None
         self.cache_mode = cache_mode
         self.cache_size = int(cache_size)
         self.cache: OrderedDict[Path, np.ndarray] = OrderedDict()
         self.shared_frames: dict[Path, torch.Tensor] = {}
+        self.sequence_sizes: dict[Path, tuple[int, int]] = {}
         self.cache_lock = Lock()
         self.sequences = [list(sequence) for sequence in sequences] if sequences is not None else []
         for path in source_dirs or []:
@@ -78,9 +91,25 @@ class SourceFramePool:
     def preload_shared_frames(self) -> None:
         unique_paths = sorted({path for sequence in self.sequences for path in sequence}, key=lambda path: (path.name.casefold(), path.name))
         for path in unique_paths:
-            frame = load_luma_image(path, size=(self.height, self.width))
+            frame = load_luma_image(path, size=self.resize_size)
             tensor = torch.from_numpy(np.ascontiguousarray(frame)).share_memory_()
             self.shared_frames[path] = tensor
+
+    def image_size(self, path: Path) -> tuple[int, int]:
+        if self.resize_size is not None:
+            return self.resize_size
+        with Image.open(path) as image:
+            width, height = image.size
+        return height, width
+
+    def sequence_size(self, sequence: list[Path]) -> tuple[int, int]:
+        first_path = sequence[0]
+        cached = self.sequence_sizes.get(first_path)
+        if cached is not None:
+            return cached
+        size = self.image_size(first_path)
+        self.sequence_sizes[first_path] = size
+        return size
 
     def crop_frame(self, frame: np.ndarray, crop_box: CropBox | None) -> np.ndarray:
         if crop_box is None:
@@ -88,18 +117,35 @@ class SourceFramePool:
         top, left, crop_height, crop_width = crop_box
         return frame[top:top + crop_height, left:left + crop_width]
 
+    def crop_box_for_sequence(self, sequence: list[Path], source_crop: SourceCrop | None) -> CropBox | None:
+        if source_crop is None:
+            return None
+        if not isinstance(source_crop, RandomCropSpec):
+            return source_crop
+        height, width = self.sequence_size(sequence)
+        max_top = height - source_crop.height
+        max_left = width - source_crop.width
+        if max_top < 0 or max_left < 0:
+            raise ValueError(f"crop size {source_crop.height}x{source_crop.width} cannot exceed sampled source size {height}x{width}")
+        rng = np.random.default_rng(source_crop.seed)
+        top_choices = max_top // source_crop.modulo + 1
+        left_choices = max_left // source_crop.modulo + 1
+        top = int(rng.integers(0, top_choices)) * source_crop.modulo
+        left = int(rng.integers(0, left_choices)) * source_crop.modulo
+        return top, left, source_crop.height, source_crop.width
+
     def load_frame(self, path: Path, crop_box: CropBox | None = None) -> np.ndarray:
         shared = self.shared_frames.get(path)
         if shared is not None:
             return self.crop_frame(shared.numpy(), crop_box)
         if self.cache_mode == "none" or self.cache_size <= 0:
-            return self.crop_frame(load_luma_image(path, size=(self.height, self.width)), crop_box)
+            return self.crop_frame(load_luma_image(path, size=self.resize_size), crop_box)
         with self.cache_lock:
             cached = self.cache.get(path)
             if cached is not None:
                 self.cache.move_to_end(path)
                 return self.crop_frame(cached, crop_box)
-        frame = load_luma_image(path, size=(self.height, self.width))
+        frame = load_luma_image(path, size=self.resize_size)
         with self.cache_lock:
             self.cache[path] = frame
             self.cache.move_to_end(path)
@@ -107,8 +153,9 @@ class SourceFramePool:
                 self.cache.popitem(last=False)
         return self.crop_frame(frame, crop_box)
 
-    def sample_frames(self, rng: np.random.Generator, count: int, crop_box: CropBox | None = None) -> list[np.ndarray]:
+    def sample_frames(self, rng: np.random.Generator, count: int, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
         sequence = self.sequences[int(rng.integers(0, len(self.sequences)))]
+        crop_box = self.crop_box_for_sequence(sequence, source_crop)
         start_max = max(len(sequence) - count, 0)
         start = int(rng.integers(0, start_max + 1)) if start_max > 0 else 0
         return [self.load_frame(sequence[(start + i) % len(sequence)], crop_box) for i in range(count)]
@@ -163,7 +210,7 @@ def add_noise(rng: np.random.Generator, fields: np.ndarray, noise_std: float) ->
     return np.clip(np.rint(fields.astype(np.float32) + noise), 0, 255).astype(np.uint8)
 
 
-def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
+def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
     window_frames = validate_window_frames(window_frames)
     radius = window_frames // 2
     target_video_index = 10 + target_phase
@@ -185,31 +232,31 @@ def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, 
     return frames
 
 
-def generate_telecine_window(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> np.ndarray:
+def generate_telecine_window(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> np.ndarray:
     frames = generate_telecine_frames(rng, height, width, target_phase, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
 
 
-def generate_video_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None = None, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
+def generate_video_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None = None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
     window_frames = validate_window_frames(window_frames)
     if source_pool is not None and source_pool.available:
         return source_pool.sample_frames(rng, window_frames, source_crop)
     raise ValueError("video samples require progressive source frames")
 
 
-def generate_video_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None = None, window_frames: int = 11, source_crop: CropBox | None = None) -> np.ndarray:
+def generate_video_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None = None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> np.ndarray:
     frames = generate_video_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
 
 
-def generate_blend_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
+def generate_blend_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
     first = generate_telecine_frames(rng, height, width, int(rng.integers(0, 5)), field_order, source_pool, window_frames, source_crop)
     second = generate_telecine_frames(rng, height, width, int(rng.integers(0, 5)), field_order, source_pool, window_frames, source_crop)
     alpha = float(rng.uniform(0.35, 0.65))
     return [np.clip(np.rint(a.astype(np.float32) * alpha + b.astype(np.float32) * (1.0 - alpha)), 0, 255).astype(np.uint8) for a, b in zip(first, second, strict=True)]
 
 
-def generate_blend_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> np.ndarray:
+def generate_blend_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> np.ndarray:
     frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
 
@@ -248,7 +295,7 @@ def resolve_worker_count(value: Any = "auto") -> int:
     return workers
 
 
-def generate_sample_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, noise_std: float, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
+def generate_sample_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, noise_std: float, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
     if label in range(5):
         frames = generate_telecine_frames(rng, height, width, label, field_order, source_pool, window_frames, source_crop)
     elif CLASS_NAMES[label] == "video":
@@ -312,6 +359,8 @@ def make_synthetic_dataset(config: dict[str, Any], overwrite: bool = False, num_
     data_config = config["data"]
     height = int(data_config["height"])
     width = int(data_config["width"])
+    if height == 0 or width == 0:
+        raise ValueError("Synthetic manifest generation requires explicit data.height and data.width; native mixed-size random crops are only supported by online training")
     if height % 2 != 0 or width % 2 != 0:
         raise ValueError("Synthetic height and width must be even")
     source_dirs = [str(path) for path in data_config.get("source_dirs", [])]

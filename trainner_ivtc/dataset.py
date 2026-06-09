@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from trainner_ivtc.fields import frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
-from trainner_ivtc.data.synthetic import CropBox, SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
+from trainner_ivtc.data.synthetic import CropBox, RandomCropSpec, SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
 
 
 def random_crop_frames(frames: list[np.ndarray], crop_height: int, crop_width: int, crop_modulo: int, rng: np.random.Generator) -> list[np.ndarray]:
@@ -123,12 +123,17 @@ class OnlineSyntheticCadenceDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         seed = self.sample_seed(index)
         rng = np.random.default_rng(seed)
-        crop_rng = np.random.default_rng((seed + 1597463007) % (2**31 - 1))
         label = sample_class_index(rng, self.class_distribution)
-        crop_box = random_crop_box(self.height, self.width, self.crop_height, self.crop_width, self.crop_modulo, crop_rng)
-        sample_height = self.crop_height if crop_box is not None else self.height
-        sample_width = self.crop_width if crop_box is not None else self.width
-        frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames, crop_box)
+        if self.crop_height > 0:
+            crop_seed = int((seed + 1597463007) % (2**31 - 1))
+            source_crop = RandomCropSpec(self.crop_height, self.crop_width, self.crop_modulo, crop_seed)
+            sample_height = self.crop_height
+            sample_width = self.crop_width
+        else:
+            source_crop = None
+            sample_height = self.height
+            sample_width = self.width
+        frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames, source_crop)
         fields = frames_to_field_tensor(frames, self.field_order)
         return {
             "fields": torch.from_numpy(fields),
