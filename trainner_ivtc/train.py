@@ -147,6 +147,9 @@ def train(config: dict[str, Any]) -> None:
             train_dataset.set_epoch(epoch)
         model.train()
         running_loss = 0.0
+        epoch_start_time = time.perf_counter()
+        last_log_time = epoch_start_time
+        last_log_step = 0
         for step, batch in enumerate(train_loader, start=1):
             total_iters += 1
             fields = batch["fields"].to(device, non_blocking=True)
@@ -160,11 +163,18 @@ def train(config: dict[str, Any]) -> None:
             scaler.update()
             running_loss += float(loss.detach().item())
             if step % int(training["print_freq"]) == 0:
-                logger.info("epoch=%d step=%d/%d loss=%.5f", epoch, step, len(train_loader), running_loss / step)
+                now = time.perf_counter()
+                recent_it_s = (step - last_log_step) / max(now - last_log_time, 1e-9)
+                epoch_it_s = step / max(now - epoch_start_time, 1e-9)
+                logger.info("epoch=%d step=%d/%d loss=%.5f it_s=%.3f epoch_it_s=%.3f", epoch, step, len(train_loader), running_loss / step, recent_it_s, epoch_it_s)
+                last_log_time = now
+                last_log_step = step
+        train_elapsed = time.perf_counter() - epoch_start_time
+        train_it_s = len(train_loader) / max(train_elapsed, 1e-9)
         metrics = evaluate(model, val_loader, device, amp)
         final_metrics = metrics
         train_loss = running_loss / max(len(train_loader), 1)
-        logger.info("epoch=%d train_loss=%.5f val_accuracy=%.4f val_macro_f1=%.4f", epoch, train_loss, float(metrics["accuracy"]), float(metrics["macro_f1"]))
+        logger.info("epoch=%d train_loss=%.5f train_it_s=%.3f val_accuracy=%.4f val_macro_f1=%.4f", epoch, train_loss, train_it_s, float(metrics["accuracy"]), float(metrics["macro_f1"]))
         logger.debug("epoch_metrics_json=%s", json.dumps({"epoch": epoch, "loss": train_loss, "val": metrics}, separators=(",", ":")))
         save_checkpoint(last_checkpoint_path, model, config, epoch, metrics)
         if float(metrics["macro_f1"]) > best_macro_f1:

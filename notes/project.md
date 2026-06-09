@@ -11,7 +11,7 @@ The v1 scope is intentionally narrow:
 - Input: progressive PNG source frames for online synthetic training or materialized synthetic generation, plus pre-extracted frame sequences for inference.
 - Internal model input: luma fields shaped as `[B, window_frames * 2, H / 2, W]`.
 - Output: one global cadence class per target frame/window.
-- Deferred: patch-grid cadence maps, local field matching, RGB/chroma features, ONNX export, VapourSynth integration, and mixed-cadence region reconstruction.
+- Deferred: patch-grid cadence maps, local field matching, RGB/chroma features, ONNX export, and mixed-cadence region reconstruction.
 
 ## Current Architecture
 
@@ -44,7 +44,7 @@ The model predicts these 9 classes:
 | `C` | `scene_cut` |
 | `U` | `unknown` |
 
-Inference derives `film_confidence`, `video_confidence`, class probabilities, and a `recommended_action` for each JSONL record.
+Inference emits compact JSONL records with `idx`, `class_id`, `class_name`, `conf`, `film_conf`, `video_conf`, and `probs`. Output class names use `pd_0..pd_4` for pulldown phases and `sc` for scene cuts. Float values are rounded to 6 decimals.
 
 ## Synthetic Data
 
@@ -57,8 +57,12 @@ Dataset split and sizing are source-frame based:
 - `train_samples_pct` and `val_samples_pct` split each alphabetically sorted source sequence into train and validation ranges.
 - Defaults are `90` and `10`.
 - Source-based train and validation samples do not draw from the same source-frame range.
+- `dataset_repeats` multiplies each online split length so small source sets can have longer epochs.
 - If both `height` and `width` are `0`, the config resolves native dimensions from the source images.
 - A bounded per-worker LRU source-frame cache is controlled by `source_cache_size`.
+- Online training can random-crop each generated sample with `crop_height`, `crop_width`, and `crop_modulo`.
+- Cropping is applied once per temporal window before field splitting, so every frame in the sample uses the same crop.
+- Crop bounds are deterministic from the sample seed and epoch, and train samples use new crops each epoch when `resample_train_each_epoch` is enabled.
 
 The generator currently applies these data variations:
 
@@ -70,6 +74,7 @@ The generator currently applies these data variations:
 - Procedural scene-cut samples using two separate generated clips with a random cut position.
 - Procedural unknown samples with static or low-motion content.
 - Optional Gaussian noise through `noise_std`.
+- Optional online-only random crop with modulo-aligned crop bounds.
 
 Important caveat: procedural `video`, `scene_cut`, and `unknown` samples may look like noise or moving synthetic patterns and may contain no recognizable source image. That is data generation behavior, not model dropout. Dropout is only applied inside the model during training.
 
@@ -116,6 +121,12 @@ python -m trainner_ivtc.infer --checkpoint experiments/sweeps/voy_intro_luma_v1/
 ```
 
 Useful options include `--field-order`, `--batch-size`, and `--device`.
+
+Example record:
+
+```json
+{"idx":123,"class_id":"2","class_name":"pd_2","conf":0.97,"film_conf":0.98,"video_conf":0.01,"probs":{"pd_0":0.01,"pd_1":0.0,"pd_2":0.97,"pd_3":0.0,"pd_4":0.0,"video":0.01,"blend":0.0,"sc":0.0,"unknown":0.01}}
+```
 
 ### `trainner_ivtc.sweep`
 

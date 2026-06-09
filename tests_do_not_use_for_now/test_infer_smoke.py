@@ -22,4 +22,5 @@ def test_inference_smoke_jsonl(tmp_path) -> None:
     run_inference(checkpoint, frames_dir, output, device_override="cpu")
     lines = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert len(lines) == 13
-    assert {"frame_index", "class_id", "class_name", "confidence", "film_confidence", "video_confidence", "probabilities", "recommended_action"} <= set(lines[0])
+    assert {"idx", "class_id", "class_name", "conf", "film_conf", "video_conf", "probs"} <= set(lines[0])
+    assert "recommended_action" not in lines[0]

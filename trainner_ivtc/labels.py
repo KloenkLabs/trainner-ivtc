@@ -23,6 +23,18 @@ FILM_CLASS_INDICES = tuple(range(5))
 VIDEO_CLASS_INDEX = CLASS_TO_INDEX["video"]
 
 
+def output_class_name(name: str) -> str:
+    if name.startswith("film_phase_"):
+        return "pd_" + name.removeprefix("film_phase_")
+    if name == "scene_cut":
+        return "sc"
+    return name
+
+
+def rounded_float(value: float) -> float:
+    return round(float(value), 6)
+
+
 def class_name(index: int) -> str:
     return CLASS_NAMES[index]
 
@@ -41,19 +53,7 @@ def class_index(name_or_id: str) -> int:
 
 def probabilities_to_dict(probabilities: torch.Tensor) -> dict[str, float]:
     values = probabilities.detach().cpu().tolist()
-    return {name: float(values[i]) for i, name in enumerate(CLASS_NAMES)}
-
-
-def recommended_action(best_name: str, film_confidence: float, video_confidence: float) -> str:
-    if best_name.startswith("film_phase_") and film_confidence >= 0.5:
-        return "ivtc_global"
-    if best_name == "video" and video_confidence >= 0.5:
-        return "deinterlace_or_preserve_30000_1001"
-    if best_name == "scene_cut":
-        return "reset_cadence"
-    if best_name == "blend":
-        return "blend_or_transition_fallback"
-    return "heuristic_fallback"
+    return {output_class_name(name): rounded_float(values[i]) for i, name in enumerate(CLASS_NAMES)}
 
 
 def prediction_to_json(frame_index: int, probabilities: torch.Tensor) -> dict[str, Any]:
@@ -64,12 +64,11 @@ def prediction_to_json(frame_index: int, probabilities: torch.Tensor) -> dict[st
     video_confidence = float(probabilities[VIDEO_CLASS_INDEX].item())
     best_name = class_name(best_index)
     return {
-        "frame_index": int(frame_index),
+        "idx": int(frame_index),
         "class_id": class_id(best_index),
-        "class_name": best_name,
-        "confidence": float(confidence.item()),
-        "film_confidence": film_confidence,
-        "video_confidence": video_confidence,
-        "probabilities": probabilities_to_dict(probabilities),
-        "recommended_action": recommended_action(best_name, film_confidence, video_confidence),
+        "class_name": output_class_name(best_name),
+        "conf": rounded_float(confidence.item()),
+        "film_conf": rounded_float(film_confidence),
+        "video_conf": rounded_float(video_confidence),
+        "probs": probabilities_to_dict(probabilities),
     }

@@ -12,9 +12,13 @@ data:
     window_frames: 11
     height: 0
     width: 0
+    crop_height: 0
+    crop_width: 0
+    crop_modulo: 2
     num_workers: auto
     train_samples_pct: 90
     val_samples_pct: 10
+    dataset_repeats: 1
     source_cache_size: 128
     resample_train_each_epoch: true
     noise_std: 2.0

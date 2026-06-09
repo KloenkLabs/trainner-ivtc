@@ -39,3 +39,21 @@ def test_config_rejects_invalid_percentages(tmp_path) -> None:
     config_path = write_config(tmp_path, "data:\n    train_samples_pct: 80\n    val_samples_pct: 10\n")
     with pytest.raises(ValueError, match="sum to 100"):
         load_config(config_path)
+
+
+def test_config_rejects_invalid_dataset_repeats(tmp_path) -> None:
+    config_path = write_config(tmp_path, "data:\n    dataset_repeats: 0\n")
+    with pytest.raises(ValueError, match="dataset_repeats"):
+        load_config(config_path)
+
+
+def test_config_rejects_crop_size_not_divisible_by_modulo(tmp_path) -> None:
+    config_path = write_config(tmp_path, "data:\n    height: 32\n    width: 48\n    crop_height: 18\n    crop_width: 32\n    crop_modulo: 4\n")
+    with pytest.raises(ValueError, match="crop_modulo"):
+        load_config(config_path)
+
+
+def test_config_rejects_crop_larger_than_source(tmp_path) -> None:
+    config_path = write_config(tmp_path, "data:\n    height: 32\n    width: 48\n    crop_height: 40\n    crop_width: 32\n    crop_modulo: 4\n")
+    with pytest.raises(ValueError, match="cannot exceed"):
+        load_config(config_path)

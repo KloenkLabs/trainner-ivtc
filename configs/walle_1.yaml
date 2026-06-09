@@ -1,37 +1,37 @@
 seed: 42
 
 paths:
-    dataset_dir: datasets/synthetic_voy_intro_luma_v1
-    output_dir: experiments/voy_intro_luma_v1
+    # dataset_dir: datasets/synthetic_voy_intro_luma_v1
+    output_dir: experiments/walle_2
 
 data:
     dataset_mode: online
     source_dirs:
-        - datasets/voy_intro_progressive_png
+        - M:/Datasets/Upscale/PretrainVSR/walle/walle-seq9-frames-640x400
     field_order: tff
-    window_frames: 7
+    window_frames: 9
     height: 0
     width: 0
     crop_height: 384
-    crop_width: 640
-    crop_modulo: 4
+    crop_width: 512
+    crop_modulo: 16
     num_workers: auto
-    train_samples_pct: 90
-    val_samples_pct: 10
-    dataset_repeats: 1
+    train_samples_pct: 93
+    val_samples_pct: 7
+    dataset_repeats: 8
     source_cache_size: 256
     resample_train_each_epoch: true
-    noise_std: 2.0
+    noise_std: 0.0 # 2.0
     class_distribution:
         film_phase_0: 0.13
         film_phase_1: 0.13
         film_phase_2: 0.13
         film_phase_3: 0.13
         film_phase_4: 0.13
-        video: 0.15
-        blend: 0.08
-        scene_cut: 0.06
-        unknown: 0.06
+        video: 0 # 0.15
+        blend: 0.06
+        scene_cut: 0 # 0.08
+        unknown: 0 # 0.06
 
 model:
     base_channels: 24
@@ -40,16 +40,16 @@ model:
 
 training:
     batch_size: 8
-    epochs: 24
-    num_workers: 8
+    epochs: 3
+    num_workers: 12
     learning_rate: 0.0003
     weight_decay: 0.01
     amp: true
     device: cuda
-    print_freq: 100
+    print_freq: 200
 
 inference:
-    batch_size: 8
+    batch_size: 4
     device: cuda
     field_order: tff
-    window_frames: 7
+    window_frames: 9

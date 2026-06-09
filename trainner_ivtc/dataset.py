@@ -11,7 +11,22 @@ from torch.utils.data import Dataset
 
 from trainner_ivtc.fields import frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
-from trainner_ivtc.data.synthetic import SourceFramePool, count_sequence_frames, generate_sample, sample_class_index, split_source_sequences
+from trainner_ivtc.data.synthetic import SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
+
+
+def random_crop_frames(frames: list[np.ndarray], crop_height: int, crop_width: int, crop_modulo: int, rng: np.random.Generator) -> list[np.ndarray]:
+    if crop_height <= 0 and crop_width <= 0:
+        return frames
+    height, width = frames[0].shape
+    max_top = height - crop_height
+    max_left = width - crop_width
+    top_choices = max_top // crop_modulo + 1
+    left_choices = max_left // crop_modulo + 1
+    top = int(rng.integers(0, top_choices)) * crop_modulo
+    left = int(rng.integers(0, left_choices)) * crop_modulo
+    bottom = top + crop_height
+    right = left + crop_width
+    return [frame[top:bottom, left:right] for frame in frames]
 
 
 class CadenceFrameDataset(Dataset):
@@ -61,11 +76,16 @@ class OnlineSyntheticCadenceDataset(Dataset):
         data = config["data"]
         train_sequences, val_sequences = split_source_sequences([str(path) for path in data.get("source_dirs", [])], int(data["train_samples_pct"]))
         sequences = train_sequences if split == "train" else val_sequences
-        self.length = count_sequence_frames(sequences)
-        if self.length <= 0:
+        self.base_length = count_sequence_frames(sequences)
+        self.dataset_repeats = int(data.get("dataset_repeats", 1))
+        self.length = self.base_length * self.dataset_repeats
+        if self.base_length <= 0:
             raise ValueError(f"Online synthetic {split} split has no source frames")
         self.height = int(data["height"])
         self.width = int(data["width"])
+        self.crop_height = int(data.get("crop_height", 0))
+        self.crop_width = int(data.get("crop_width", 0))
+        self.crop_modulo = int(data.get("crop_modulo", 2))
         self.window_frames = int(data["window_frames"])
         self.field_order = validate_field_order(str(data["field_order"]).lower())
         self.noise_std = float(data.get("noise_std", 0.0))
@@ -88,9 +108,13 @@ class OnlineSyntheticCadenceDataset(Dataset):
         return int((self.base_seed + index * 1009 + epoch * 1000003) % (2**31 - 1))
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        rng = np.random.default_rng(self.sample_seed(index))
+        seed = self.sample_seed(index)
+        rng = np.random.default_rng(seed)
+        crop_rng = np.random.default_rng((seed + 1597463007) % (2**31 - 1))
         label = sample_class_index(rng, self.class_distribution)
-        fields = generate_sample(rng, self.height, self.width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames).astype(np.float32) / 255.0
+        frames = generate_sample_frames(rng, self.height, self.width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames)
+        frames = random_crop_frames(frames, self.crop_height, self.crop_width, self.crop_modulo, crop_rng)
+        fields = frames_to_field_tensor(frames, self.field_order).astype(np.float32) / 255.0
         return {
             "fields": torch.from_numpy(fields),
             "label": torch.tensor(label, dtype=torch.long),

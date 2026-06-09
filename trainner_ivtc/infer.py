@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -54,6 +55,7 @@ def make_window_tensor(load_frame: Callable[[int], np.ndarray], total_frames: in
 
 
 def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_path: str | Path, field_order_override: str | None = None, batch_size_override: int | None = None, device_override: str | None = None) -> None:
+    start_time = time.perf_counter()
     device = resolve_device(device_override)
     model, checkpoint = load_checkpoint_model(checkpoint_path, device)
     config = checkpoint.get("config", {})
@@ -62,6 +64,9 @@ def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_pat
     field_order = validate_field_order((field_order_override or checkpoint.get("field_order") or inference_config.get("field_order", "tff")).lower())
     batch_size = int(batch_size_override or inference_config.get("batch_size", 16))
     paths = iter_image_paths(input_dir)
+    total_batches = (len(paths) + batch_size - 1) // batch_size
+    progress_freq = max(1, total_batches // 20)
+    print(f"Starting inference: frames={len(paths)} batches={total_batches} batch_size={batch_size} device={device} field_order={field_order} window_frames={window_frames}", flush=True)
 
     @lru_cache(maxsize=max(256, window_frames * batch_size * 2))
     def load_cached(index: int) -> np.ndarray:
@@ -69,7 +74,7 @@ def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_pat
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f, torch.inference_mode():
-        for start in range(0, len(paths), batch_size):
+        for batch_index, start in enumerate(range(0, len(paths), batch_size), start=1):
             frame_indices = list(range(start, min(start + batch_size, len(paths))))
             batch = np.stack([make_window_tensor(load_cached, len(paths), frame_index, window_frames, field_order) for frame_index in frame_indices], axis=0)
             tensor = torch.from_numpy(batch).to(device, non_blocking=True)
@@ -77,6 +82,14 @@ def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_pat
             probabilities = torch.softmax(logits.float(), dim=1).cpu()
             for frame_index, probs in zip(frame_indices, probabilities, strict=False):
                 f.write(json.dumps(prediction_to_json(frame_index, probs), separators=(",", ":")) + "\n")
+            if batch_index == 1 or batch_index == total_batches or batch_index % progress_freq == 0:
+                processed = min(start + batch_size, len(paths))
+                elapsed = time.perf_counter() - start_time
+                fps = processed / elapsed if elapsed > 0 else 0.0
+                print(f"inference batch={batch_index}/{total_batches} frames={processed}/{len(paths)} fps={fps:.2f}", flush=True)
+    elapsed = time.perf_counter() - start_time
+    fps = len(paths) / elapsed if elapsed > 0 else 0.0
+    print(f"Inference complete: frames={len(paths)} elapsed={elapsed:.2f}s fps={fps:.2f} output={out_path}", flush=True)
 
 
 def main() -> None:
