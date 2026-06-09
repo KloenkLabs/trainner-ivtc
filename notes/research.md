@@ -132,14 +132,13 @@ The small test checkpoint successfully ran inference on `datasets/gt_test1` and 
 
 ## Data Generation Caveats
 
-Some generated samples look like synthetic noise or moving procedural patterns with no visible source-frame content. This is intentional for the current `video`, `scene_cut`, and `unknown` classes. Film phase samples and blend samples use source frames.
+Some generated samples look like synthetic noise or moving procedural patterns with no visible source-frame content. This is intentional for the current `unknown` class. Film phase, video/PsF, and blend samples use source frames.
 
 This is not dropout. Dropout is model-side regularization and only affects hidden activations during training.
 
 Current data risks:
 
-- Procedural negative classes may be too visually different from real DVD video, credits, and VFX shots.
-- `scene_cut` and `unknown` should probably gain source-based variants.
-- True-video examples should eventually come from real or better synthesized 29.97i/29.97p material.
+- Procedural negative classes may be too visually different from real DVD credits and VFX shots.
+- True-video/PsF examples now come directly from progressive source windows.
 - The validation set is synthetic and may overstate usefulness on real mixed-content DVD footage.
 - Previous sweep results used materialized synthetic datasets; online-mode performance and best hyperparameters need a new benchmark.

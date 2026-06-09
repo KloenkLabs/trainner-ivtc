@@ -30,6 +30,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "train_samples_pct": 90,
         "val_samples_pct": 10,
         "dataset_repeats": 1,
+        "source_cache_mode": "lru",
         "source_cache_size": 256,
         "resample_train_each_epoch": True,
         "class_distribution": {
@@ -40,7 +41,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "film_phase_4": 0.13,
             "video": 0.15,
             "blend": 0.08,
-            "scene_cut": 0.06,
             "unknown": 0.06,
         },
         "noise_std": 2.0,
@@ -59,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "amp": True,
         "device": "cuda",
         "print_freq": 25,
+        "prefetch_factor": 2,
     },
     "inference": {
         "batch_size": 16,
@@ -139,6 +140,10 @@ def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data["dataset_repeats"] = int(data.get("dataset_repeats", 1))
     if data["dataset_repeats"] < 1:
         raise ValueError(f"{config_path}: data.dataset_repeats must be >= 1")
+    source_cache_mode = str(data.get("source_cache_mode", "lru"))
+    if source_cache_mode not in {"shared_ram", "lru", "none"}:
+        raise ValueError(f"{config_path}: data.source_cache_mode must be 'shared_ram', 'lru', or 'none', got {source_cache_mode!r}")
+    data["source_cache_mode"] = source_cache_mode
     data["source_cache_size"] = int(data.get("source_cache_size", 256))
     if data["source_cache_size"] < 0:
         raise ValueError(f"{config_path}: data.source_cache_size must be >= 0")

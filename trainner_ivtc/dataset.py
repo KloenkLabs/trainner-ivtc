@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from trainner_ivtc.fields import frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
-from trainner_ivtc.data.synthetic import SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
+from trainner_ivtc.data.synthetic import CropBox, SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
 
 
 def random_crop_frames(frames: list[np.ndarray], crop_height: int, crop_width: int, crop_modulo: int, rng: np.random.Generator) -> list[np.ndarray]:
@@ -27,6 +27,18 @@ def random_crop_frames(frames: list[np.ndarray], crop_height: int, crop_width: i
     bottom = top + crop_height
     right = left + crop_width
     return [frame[top:bottom, left:right] for frame in frames]
+
+
+def random_crop_box(height: int, width: int, crop_height: int, crop_width: int, crop_modulo: int, rng: np.random.Generator) -> CropBox | None:
+    if crop_height <= 0 and crop_width <= 0:
+        return None
+    max_top = height - crop_height
+    max_left = width - crop_width
+    top_choices = max_top // crop_modulo + 1
+    left_choices = max_left // crop_modulo + 1
+    top = int(rng.integers(0, top_choices)) * crop_modulo
+    left = int(rng.integers(0, left_choices)) * crop_modulo
+    return top, left, crop_height, crop_width
 
 
 class CadenceFrameDataset(Dataset):
@@ -92,7 +104,8 @@ class OnlineSyntheticCadenceDataset(Dataset):
         self.class_distribution = data["class_distribution"]
         self.resample_train_each_epoch = bool(data.get("resample_train_each_epoch", True))
         self.base_seed = int(config.get("seed", 1234)) + (0 if split == "train" else 100000000)
-        self.source_pool = SourceFramePool(None, self.height, self.width, sequences, int(data.get("source_cache_size", 256)))
+        cache_mode = str(data.get("source_cache_mode", "lru"))
+        self.source_pool = SourceFramePool(None, self.height, self.width, sequences, int(data.get("source_cache_size", 256)), cache_mode)
 
     def __len__(self) -> int:
         return self.length
@@ -112,9 +125,11 @@ class OnlineSyntheticCadenceDataset(Dataset):
         rng = np.random.default_rng(seed)
         crop_rng = np.random.default_rng((seed + 1597463007) % (2**31 - 1))
         label = sample_class_index(rng, self.class_distribution)
-        frames = generate_sample_frames(rng, self.height, self.width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames)
-        frames = random_crop_frames(frames, self.crop_height, self.crop_width, self.crop_modulo, crop_rng)
-        fields = frames_to_field_tensor(frames, self.field_order).astype(np.float32) / 255.0
+        crop_box = random_crop_box(self.height, self.width, self.crop_height, self.crop_width, self.crop_modulo, crop_rng)
+        sample_height = self.crop_height if crop_box is not None else self.height
+        sample_width = self.crop_width if crop_box is not None else self.width
+        frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.noise_std, self.window_frames, crop_box)
+        fields = frames_to_field_tensor(frames, self.field_order)
         return {
             "fields": torch.from_numpy(fields),
             "label": torch.tensor(label, dtype=torch.long),

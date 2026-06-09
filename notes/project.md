@@ -24,13 +24,13 @@ The classifier is a lightweight fully convolutional 2D CNN over stacked luma fie
 - Fields are stacked along the channel axis.
 - Residual/downsampling blocks extract temporal-spatial features from the stacked field tensor.
 - Global average pooling collapses the spatial dimensions.
-- A linear classifier head emits 9 logits.
+- A linear classifier head emits 8 logits.
 
 For the current Voyager intro config, an 11-frame 760x480 sample becomes a model tensor of `[22, 240, 760]`. The tested model defaults are `base_channels: 24`, `channel_mult: [1, 2, 4, 4]`, and `dropout: 0.1`.
 
 ## Classes
 
-The model predicts these 9 classes:
+The model predicts these 8 classes:
 
 | ID | Class name |
 | --- | --- |
@@ -41,10 +41,9 @@ The model predicts these 9 classes:
 | `4` | `film_phase_4` |
 | `V` | `video` |
 | `B` | `blend` |
-| `C` | `scene_cut` |
 | `U` | `unknown` |
 
-Inference emits compact JSONL records with `idx`, `class_id`, `class_name`, `conf`, `film_conf`, `video_conf`, and `probs`. Output class names use `pd_0..pd_4` for pulldown phases and `sc` for scene cuts. Float values are rounded to 6 decimals.
+Inference emits compact JSONL records with `idx`, `class_id`, `class_name`, `conf`, `film_conf`, `video_conf`, and `probs`. Output class names use `pd_0..pd_4` for pulldown phases. Float values are rounded to 6 decimals.
 
 ## Synthetic Data
 
@@ -58,6 +57,7 @@ Dataset split and sizing are source-frame based:
 - Defaults are `90` and `10`.
 - Source-based train and validation samples do not draw from the same source-frame range.
 - `dataset_repeats` multiplies each online split length so small source sets can have longer epochs.
+- `source_cache_mode` controls source frame caching: `shared_ram` preloads luma frames once for DataLoader workers, `lru` keeps the previous bounded per-worker cache, and `none` disables caching.
 - If both `height` and `width` are `0`, the config resolves native dimensions from the source images.
 - A bounded per-worker LRU source-frame cache is controlled by `source_cache_size`.
 - Online training can random-crop each generated sample with `crop_height`, `crop_width`, and `crop_modulo`.
@@ -70,13 +70,12 @@ The generator currently applies these data variations:
 - Configurable field order, currently `tff` or `bff`.
 - 3:2 pulldown field pairing using the current film phase.
 - Source-frame blend samples by blending two telecined windows with a random alpha.
-- Procedural true-video samples with moving texture and simple moving patterns.
-- Procedural scene-cut samples using two separate generated clips with a random cut position.
+- Progressive/PsF `video` samples that keep source frames unchanged.
 - Procedural unknown samples with static or low-motion content.
 - Optional Gaussian noise through `noise_std`.
 - Optional online-only random crop with modulo-aligned crop bounds.
 
-Important caveat: procedural `video`, `scene_cut`, and `unknown` samples may look like noise or moving synthetic patterns and may contain no recognizable source image. That is data generation behavior, not model dropout. Dropout is only applied inside the model during training.
+Important caveat: procedural `unknown` samples may look like noise or moving synthetic patterns and may contain no recognizable source image. That is data generation behavior, not model dropout. Dropout is only applied inside the model during training.
 
 ## Scripts
 
@@ -108,7 +107,7 @@ Example:
 python -m trainner_ivtc.train --config configs/voy_intro_luma_v1.yaml
 ```
 
-Training logs compact progress to the terminal. JSON metrics and detailed messages are written to `train.log` in the experiment output directory. The trainer validates after each epoch, writes `last.pt`, and updates `best.pt` when validation macro F1 improves. Online training resamples train samples each epoch while keeping validation fixed.
+Training logs compact progress to the terminal. JSON metrics and detailed messages are written to `train.log` in the experiment output directory. The trainer validates after each epoch, writes `last.pt`, and updates `best.pt` when validation macro F1 improves. Macro F1 averages only classes with `class_distribution` weight at least `0.001`. Online training resamples train samples each epoch while keeping validation fixed.
 
 ### `trainner_ivtc.infer`
 
@@ -125,7 +124,7 @@ Useful options include `--field-order`, `--batch-size`, and `--device`.
 Example record:
 
 ```json
-{"idx":123,"class_id":"2","class_name":"pd_2","conf":0.97,"film_conf":0.98,"video_conf":0.01,"probs":{"pd_0":0.01,"pd_1":0.0,"pd_2":0.97,"pd_3":0.0,"pd_4":0.0,"video":0.01,"blend":0.0,"sc":0.0,"unknown":0.01}}
+{"idx":123,"class_id":"2","class_name":"pd_2","conf":0.97,"film_conf":0.98,"video_conf":0.01,"probs":{"pd_0":0.01,"pd_1":0.0,"pd_2":0.97,"pd_3":0.0,"pd_4":0.0,"video":0.01,"blend":0.0,"unknown":0.01}}
 ```
 
 ### `trainner_ivtc.sweep`

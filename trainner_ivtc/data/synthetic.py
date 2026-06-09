@@ -11,11 +11,15 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
+import torch
 from PIL import Image
 
 from trainner_ivtc.fields import FieldOrder, frames_to_field_tensor, telecine_pair_for_frame, validate_field_order, validate_window_frames, weave_field_pair
 from trainner_ivtc.image_io import iter_image_paths, load_luma_image, save_luma_image
 from trainner_ivtc.labels import CLASS_NAMES, CLASS_TO_INDEX, class_id
+
+
+CropBox = tuple[int, int, int, int]
 
 
 @dataclass
@@ -38,11 +42,13 @@ class ProceduralClip:
 
 
 class SourceFramePool:
-    def __init__(self, source_dirs: list[str] | None, height: int, width: int, sequences: list[list[Path]] | None = None, cache_size: int = 0) -> None:
+    def __init__(self, source_dirs: list[str] | None, height: int, width: int, sequences: list[list[Path]] | None = None, cache_size: int = 0, cache_mode: str = "lru") -> None:
         self.height = height
         self.width = width
+        self.cache_mode = cache_mode
         self.cache_size = int(cache_size)
         self.cache: OrderedDict[Path, np.ndarray] = OrderedDict()
+        self.shared_frames: dict[Path, torch.Tensor] = {}
         self.cache_lock = Lock()
         self.sequences = [list(sequence) for sequence in sequences] if sequences is not None else []
         for path in source_dirs or []:
@@ -52,6 +58,8 @@ class SourceFramePool:
                 except FileNotFoundError:
                     continue
         self.sequences = [sequence for sequence in self.sequences if sequence]
+        if self.cache_mode == "shared_ram":
+            self.preload_shared_frames()
 
     @property
     def available(self) -> bool:
@@ -67,27 +75,43 @@ class SourceFramePool:
         self.__dict__.update(state)
         self.cache_lock = Lock()
 
-    def load_frame(self, path: Path) -> np.ndarray:
-        if self.cache_size <= 0:
-            return load_luma_image(path, size=(self.height, self.width))
+    def preload_shared_frames(self) -> None:
+        unique_paths = sorted({path for sequence in self.sequences for path in sequence}, key=lambda path: (path.name.casefold(), path.name))
+        for path in unique_paths:
+            frame = load_luma_image(path, size=(self.height, self.width))
+            tensor = torch.from_numpy(np.ascontiguousarray(frame)).share_memory_()
+            self.shared_frames[path] = tensor
+
+    def crop_frame(self, frame: np.ndarray, crop_box: CropBox | None) -> np.ndarray:
+        if crop_box is None:
+            return frame
+        top, left, crop_height, crop_width = crop_box
+        return frame[top:top + crop_height, left:left + crop_width]
+
+    def load_frame(self, path: Path, crop_box: CropBox | None = None) -> np.ndarray:
+        shared = self.shared_frames.get(path)
+        if shared is not None:
+            return self.crop_frame(shared.numpy(), crop_box)
+        if self.cache_mode == "none" or self.cache_size <= 0:
+            return self.crop_frame(load_luma_image(path, size=(self.height, self.width)), crop_box)
         with self.cache_lock:
             cached = self.cache.get(path)
             if cached is not None:
                 self.cache.move_to_end(path)
-                return cached
+                return self.crop_frame(cached, crop_box)
         frame = load_luma_image(path, size=(self.height, self.width))
         with self.cache_lock:
             self.cache[path] = frame
             self.cache.move_to_end(path)
             while len(self.cache) > self.cache_size:
                 self.cache.popitem(last=False)
-        return frame
+        return self.crop_frame(frame, crop_box)
 
-    def sample_frames(self, rng: np.random.Generator, count: int) -> list[np.ndarray]:
+    def sample_frames(self, rng: np.random.Generator, count: int, crop_box: CropBox | None = None) -> list[np.ndarray]:
         sequence = self.sequences[int(rng.integers(0, len(self.sequences)))]
         start_max = max(len(sequence) - count, 0)
         start = int(rng.integers(0, start_max + 1)) if start_max > 0 else 0
-        return [self.load_frame(sequence[(start + i) % len(sequence)]) for i in range(count)]
+        return [self.load_frame(sequence[(start + i) % len(sequence)], crop_box) for i in range(count)]
 
 
 def split_sequence_paths(paths: list[Path], train_pct: int) -> tuple[list[Path], list[Path]]:
@@ -139,7 +163,7 @@ def add_noise(rng: np.random.Generator, fields: np.ndarray, noise_std: float) ->
     return np.clip(np.rint(fields.astype(np.float32) + noise), 0, 255).astype(np.uint8)
 
 
-def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11) -> list[np.ndarray]:
+def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
     window_frames = validate_window_frames(window_frames)
     radius = window_frames // 2
     target_video_index = 10 + target_phase
@@ -149,7 +173,7 @@ def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, 
     max_film = max(max(pair) for pair in pairs)
     count = max_film - min_film + 1
     if source_pool is not None and source_pool.available:
-        progressive_frames = source_pool.sample_frames(rng, count)
+        progressive_frames = source_pool.sample_frames(rng, count, source_crop)
     else:
         clip = make_procedural_clip(rng, height, width, motion=True)
         progressive_frames = [clip.frame(i) for i in range(count)]
@@ -161,48 +185,32 @@ def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, 
     return frames
 
 
-def generate_telecine_window(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11) -> np.ndarray:
-    frames = generate_telecine_frames(rng, height, width, target_phase, field_order, source_pool, window_frames)
+def generate_telecine_window(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> np.ndarray:
+    frames = generate_telecine_frames(rng, height, width, target_phase, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
 
 
-def generate_video_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> list[np.ndarray]:
+def generate_video_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None = None, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
     window_frames = validate_window_frames(window_frames)
-    clip = make_procedural_clip(rng, height, width, motion=True)
-    return [weave_field_pair(clip.frame(i * 2), clip.frame(i * 2 + 1), field_order) for i in range(window_frames)]
+    if source_pool is not None and source_pool.available:
+        return source_pool.sample_frames(rng, window_frames, source_crop)
+    raise ValueError("video samples require progressive source frames")
 
 
-def generate_video_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> np.ndarray:
-    frames = generate_video_frames(rng, height, width, field_order, window_frames)
+def generate_video_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None = None, window_frames: int = 11, source_crop: CropBox | None = None) -> np.ndarray:
+    frames = generate_video_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
 
 
-def generate_blend_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11) -> list[np.ndarray]:
-    first = generate_telecine_frames(rng, height, width, int(rng.integers(0, 5)), field_order, source_pool, window_frames)
-    second = generate_telecine_frames(rng, height, width, int(rng.integers(0, 5)), field_order, source_pool, window_frames)
+def generate_blend_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
+    first = generate_telecine_frames(rng, height, width, int(rng.integers(0, 5)), field_order, source_pool, window_frames, source_crop)
+    second = generate_telecine_frames(rng, height, width, int(rng.integers(0, 5)), field_order, source_pool, window_frames, source_crop)
     alpha = float(rng.uniform(0.35, 0.65))
     return [np.clip(np.rint(a.astype(np.float32) * alpha + b.astype(np.float32) * (1.0 - alpha)), 0, 255).astype(np.uint8) for a, b in zip(first, second, strict=True)]
 
 
-def generate_blend_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11) -> np.ndarray:
-    frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames)
-    return frames_to_field_tensor(frames, field_order)
-
-
-def generate_scene_cut_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> list[np.ndarray]:
-    window_frames = validate_window_frames(window_frames)
-    first_clip = make_procedural_clip(rng, height, width, motion=True)
-    second_clip = make_procedural_clip(rng, height, width, motion=True)
-    cut_at = int(rng.integers(max(1, window_frames // 3), max(2, window_frames - window_frames // 3)))
-    frames = []
-    for i in range(window_frames):
-        clip = first_clip if i < cut_at else second_clip
-        frames.append(weave_field_pair(clip.frame(i * 2), clip.frame(i * 2 + 1), field_order))
-    return frames
-
-
-def generate_scene_cut_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> np.ndarray:
-    frames = generate_scene_cut_frames(rng, height, width, field_order, window_frames)
+def generate_blend_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: CropBox | None = None) -> np.ndarray:
+    frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
 
 
@@ -240,15 +248,13 @@ def resolve_worker_count(value: Any = "auto") -> int:
     return workers
 
 
-def generate_sample_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, noise_std: float, window_frames: int = 11) -> list[np.ndarray]:
+def generate_sample_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, label: int, source_pool: SourceFramePool | None, noise_std: float, window_frames: int = 11, source_crop: CropBox | None = None) -> list[np.ndarray]:
     if label in range(5):
-        frames = generate_telecine_frames(rng, height, width, label, field_order, source_pool, window_frames)
+        frames = generate_telecine_frames(rng, height, width, label, field_order, source_pool, window_frames, source_crop)
     elif CLASS_NAMES[label] == "video":
-        frames = generate_video_frames(rng, height, width, field_order, window_frames)
+        frames = generate_video_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     elif CLASS_NAMES[label] == "blend":
-        frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames)
-    elif CLASS_NAMES[label] == "scene_cut":
-        frames = generate_scene_cut_frames(rng, height, width, field_order, window_frames)
+        frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     else:
         frames = generate_unknown_frames(rng, height, width, field_order, window_frames)
     return [add_noise(rng, frame, noise_std) for frame in frames]

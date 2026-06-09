@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from functools import lru_cache
@@ -18,9 +20,9 @@ from trainner_ivtc.model import build_model
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run global luma cadence inference on an image sequence.")
+    parser = argparse.ArgumentParser(description="Run global luma cadence inference on an image sequence or video.")
     parser.add_argument("--checkpoint", required=True, help="Path to a trained checkpoint.")
-    parser.add_argument("--input", required=True, help="Directory containing extracted interlaced frames.")
+    parser.add_argument("--input", required=True, help="Directory containing extracted interlaced frames, or an MP4/MKV video.")
     parser.add_argument("--output", required=True, help="Output JSONL path.")
     parser.add_argument("--field-order", choices=["tff", "bff"], default=None, help="Override checkpoint/config field order.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override inference batch size.")
@@ -54,6 +56,44 @@ def make_window_tensor(load_frame: Callable[[int], np.ndarray], total_frames: in
     return frames_to_field_tensor(frames, field_order).astype(np.float32) / 255.0
 
 
+def is_numbered_png_frame(path: Path) -> bool:
+    return path.is_file() and path.suffix == ".png" and len(path.stem) == 8 and path.stem.isdigit() and path.stat().st_size > 0
+
+
+def valid_numbered_png_frames(folder: Path) -> list[Path]:
+    paths = [path for path in folder.iterdir() if is_numbered_png_frame(path)]
+    paths.sort(key=lambda path: path.name)
+    return paths
+
+
+def video_frames_dir(video_path: Path) -> Path:
+    return video_path.with_name(f"{video_path.stem}_frames")
+
+
+def resolve_input_paths(input_path: str | Path) -> list[Path]:
+    path = Path(input_path)
+    if path.is_dir():
+        return iter_image_paths(path)
+    if path.suffix.lower() not in {".mp4", ".mkv"}:
+        raise ValueError(f"Inference input must be an image directory or an MP4/MKV video: {path}")
+    output_dir = video_frames_dir(path)
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError(f"Video frame output path already exists and is not a directory: {output_dir}")
+    if output_dir.exists() and any(child.is_file() for child in output_dir.iterdir()):
+        print(f"WARNING: skipping frame extraction because output directory already exists and contains files: {output_dir}", file=sys.stderr, flush=True)
+        paths = valid_numbered_png_frames(output_dir)
+        if len(paths) < 2:
+            raise SystemExit(f"No usable extracted frames found in {output_dir}; expected at least two non-empty files named like 00000001.png")
+        return paths
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = output_dir / "%08d.png"
+    subprocess.run(["ffmpeg", "-loglevel", "warning", "-stats", "-i", str(path), "-map", "0:v:0", "-fps_mode", "passthrough", str(output_pattern)], check=True)
+    paths = valid_numbered_png_frames(output_dir)
+    if len(paths) < 2:
+        raise SystemExit(f"No usable extracted frames found in {output_dir}; expected at least two non-empty files named like 00000001.png")
+    return paths
+
+
 def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_path: str | Path, field_order_override: str | None = None, batch_size_override: int | None = None, device_override: str | None = None) -> None:
     start_time = time.perf_counter()
     device = resolve_device(device_override)
@@ -63,7 +103,7 @@ def run_inference(checkpoint_path: str | Path, input_dir: str | Path, output_pat
     window_frames = int(checkpoint.get("window_frames", inference_config.get("window_frames", 11)))
     field_order = validate_field_order((field_order_override or checkpoint.get("field_order") or inference_config.get("field_order", "tff")).lower())
     batch_size = int(batch_size_override or inference_config.get("batch_size", 16))
-    paths = iter_image_paths(input_dir)
+    paths = resolve_input_paths(input_dir)
     total_batches = (len(paths) + batch_size - 1) // batch_size
     progress_freq = max(1, total_batches // 20)
     print(f"Starting inference: frames={len(paths)} batches={total_batches} batch_size={batch_size} device={device} field_order={field_order} window_frames={window_frames}", flush=True)

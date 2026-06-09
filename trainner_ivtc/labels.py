@@ -13,10 +13,9 @@ CLASS_NAMES: tuple[str, ...] = (
     "film_phase_4",
     "video",
     "blend",
-    "scene_cut",
     "unknown",
 )
-CLASS_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "V", "B", "C", "U")
+CLASS_IDS: tuple[str, ...] = ("0", "1", "2", "3", "4", "V", "B", "U")
 CLASS_TO_INDEX = {name: i for i, name in enumerate(CLASS_NAMES)}
 ID_TO_INDEX = {class_id: i for i, class_id in enumerate(CLASS_IDS)}
 FILM_CLASS_INDICES = tuple(range(5))
@@ -26,8 +25,6 @@ VIDEO_CLASS_INDEX = CLASS_TO_INDEX["video"]
 def output_class_name(name: str) -> str:
     if name.startswith("film_phase_"):
         return "pd_" + name.removeprefix("film_phase_")
-    if name == "scene_cut":
-        return "sc"
     return name
 
 
