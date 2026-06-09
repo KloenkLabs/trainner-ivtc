@@ -2,16 +2,16 @@
 
 ## Project Goal
 
-`trainner-ivtc` is a synthetic-first neural cadence classifier for downstream IVTC workflows. The first MVP is a global luma classifier: it looks at a short temporal window of interlaced frames, split into luma fields, and predicts cadence metadata with confidence scores.
+`trainner-ivtc` is a synthetic-first neural cadence classifier for downstream IVTC workflows. The current model looks at a short temporal window of interlaced frames, split into luma fields, and predicts dense cadence evidence over a spatial grid.
 
-The model does not reconstruct progressive frames and does not perform IVTC itself. Inference writes JSONL metadata intended for later VapourSynth processing.
+The model does not reconstruct progressive frames and does not perform IVTC itself. Inference can write global JSONL metadata for compatibility and compact RGB grid maps for downstream region-aware parsing.
 
 The v1 scope is intentionally narrow:
 
 - Input: progressive PNG source frames for online synthetic training or materialized synthetic generation, plus pre-extracted frame sequences for inference.
 - Internal model input: luma fields shaped as `[B, window_frames * 2, H / 2, W]`.
-- Output: one global cadence class per target frame/window.
-- Deferred: patch-grid cadence maps, local field matching, RGB/chroma features, ONNX export, and mixed-cadence region reconstruction.
+- Output: dense cadence logits shaped `[B, classes, grid_h, grid_w]`, plus global logits from spatially averaged dense logits.
+- Deferred: local field matching, RGB/chroma features, ONNX export, and mixed-cadence region reconstruction.
 
 ## Current Architecture
 
@@ -23,8 +23,8 @@ The classifier is a lightweight fully convolutional 2D CNN over stacked luma fie
 - Each interlaced frame is split into top and bottom fields.
 - Fields are stacked along the channel axis.
 - Residual/downsampling blocks extract temporal-spatial features from the stacked field tensor.
-- Global average pooling collapses the spatial dimensions.
-- A linear classifier head emits 8 logits.
+- A 1x1 dense classifier head emits 8 logits per grid cell.
+- Global compatibility logits are derived by averaging dense logits over the grid.
 
 For the current Voyager intro config, an 11-frame 760x480 sample becomes a model tensor of `[22, 240, 760]`. The tested model defaults are `base_channels: 24`, `channel_mult: [1, 2, 4, 4]`, and `dropout: 0.1`.
 
@@ -44,6 +44,8 @@ The model predicts these 8 classes:
 | `U` | `unknown` |
 
 Inference emits compact JSONL records with `idx`, `class_id`, `class_name`, `conf`, `film_conf`, `video_conf`, and `probs`. Output class names use `pd_0..pd_4` for pulldown phases. Float values are rounded to 6 decimals.
+
+Grid inference can also write one lossless RGB PNG map per frame under `maps/` plus `grid_meta.json`. Map channels are `R=class_index`, `G=primary confidence scaled to 0..255`, and `B=film confidence scaled to 0..255`. The map is stored at the model-native grid resolution, not upsampled to source frame resolution.
 
 ## Synthetic Data
 
@@ -76,6 +78,7 @@ The generator currently applies these data variations:
 - Optional Gaussian noise with a configurable `std_range`.
 - Optional under-exposure by multiplying all frames in a window by a sampled darkening factor.
 - Optional online-only random crop with modulo-aligned crop bounds.
+- Optional mixed-cadence samples that composite two independently generated film phases and return dense per-cell labels with ignored boundary cells.
 
 Important caveat: procedural `unknown` samples may look like noise or moving synthetic patterns and may contain no recognizable source image. That is data generation behavior, not model dropout. Dropout is only applied inside the model during training.
 
@@ -101,7 +104,7 @@ By default, `data.num_workers: auto` uses the system CPU core count. Generation 
 
 ### `trainner_ivtc.train`
 
-Trains the global classifier. With `data.dataset_mode: online`, training reads source PNGs and generates synthetic samples on the fly. With `data.dataset_mode: manifest`, training reads a generated dataset manifest.
+Trains the dense grid classifier. With `data.dataset_mode: online`, training reads source PNGs and generates synthetic samples on the fly. With `data.dataset_mode: manifest`, training reads a generated dataset manifest.
 
 Example:
 
@@ -113,7 +116,7 @@ Training logs compact progress to the terminal. JSON metrics and detailed messag
 
 ### `trainner_ivtc.infer`
 
-Runs inference on a pre-extracted frame sequence and writes JSONL predictions.
+Runs inference on a pre-extracted frame sequence and writes JSONL predictions by default.
 
 Example:
 
@@ -121,7 +124,11 @@ Example:
 python -m trainner_ivtc.infer --checkpoint experiments/sweeps/voy_intro_luma_v1/wf7_bs8_ep16/checkpoints/best.pt --input datasets/gt_test1 --output predictions.jsonl
 ```
 
-Useful options include `--field-order`, `--batch-size`, and `--device`.
+Useful options include `--field-order`, `--batch-size`, and `--device`. Dense grid maps can be enabled with:
+
+```powershell
+python -m trainner_ivtc.infer --checkpoint experiments/mdl3set_7f_3/checkpoints/best.pt --input input_frames --output predictions.jsonl --output-mode both --grid-output-dir predictions_grid
+```
 
 Example record:
 

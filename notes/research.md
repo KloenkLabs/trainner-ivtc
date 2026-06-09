@@ -4,6 +4,8 @@
 
 The first useful baseline is a global luma cadence classifier trained only on synthetic data. It is fast enough to train on an RTX 4090 at native SD-like resolution and produces JSONL metadata suitable for downstream VapourSynth experiments.
 
+The next architecture revision keeps the same convolutional trunk but replaces global pooling with a 1x1 dense head. Global JSONL can still be derived by spatially averaging dense logits, while grid-map inference emits compact RGB PNG maps for per-block downstream cadence parsing.
+
 Validation is used during training after every epoch to compute metrics and choose `best.pt`. It is not used for gradient updates and there is no early stopping yet.
 
 The data pipeline now supports online synthetic generation. This should simplify training and avoid generated sample-folder I/O, but training speed should be re-measured because CPU generation and PNG decode throughput may become the bottleneck.

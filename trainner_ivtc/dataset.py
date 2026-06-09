@@ -11,7 +11,8 @@ from torch.utils.data import Dataset
 
 from trainner_ivtc.fields import FieldOrder, frames_to_field_tensor, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
-from trainner_ivtc.data.synthetic import CropBox, RandomCropSpec, SourceFramePool, count_sequence_frames, generate_sample_frames, sample_class_index, split_source_sequences
+from trainner_ivtc.grid import dense_grid_shape
+from trainner_ivtc.data.synthetic import CropBox, RandomCropSpec, SourceFramePool, count_sequence_frames, generate_mixed_cadence_sample, generate_sample_frames, sample_class_index, split_source_sequences
 
 
 def random_crop_frames(frames: list[np.ndarray], crop_height: int, crop_width: int, crop_modulo: int, rng: np.random.Generator) -> list[np.ndarray]:
@@ -101,15 +102,21 @@ class OnlineSyntheticCadenceDataset(Dataset):
         self.crop_height = int(data.get("crop_height", 0))
         self.crop_width = int(data.get("crop_width", 0))
         self.crop_modulo = int(data.get("crop_modulo", 2))
+        self.sample_height = self.crop_height if self.crop_height > 0 else self.height
+        self.sample_width = self.crop_width if self.crop_width > 0 else self.width
         self.window_frames = int(data["window_frames"])
         self.field_order: FieldOrder = validate_field_order(str(data["field_order"]).lower())
         self.augmentations = data.get("augmentations", {})
+        self.mixed_cadence = data.get("mixed_cadence", {})
+        self.mixed_cadence_chance = float(self.mixed_cadence.get("chance", 0.0))
+        self.mixed_boundary_cells = int(self.mixed_cadence.get("boundary_cells", 1))
         self.augmentations_enabled = split == "train"
         self.class_distribution = data["class_distribution"]
         self.resample_train_each_epoch = bool(data.get("resample_train_each_epoch", True))
         self.base_seed = int(config.get("seed", 1234)) + (0 if split == "train" else 100000000)
         cache_mode = str(data.get("source_cache_mode", "lru"))
         self.source_pool = SourceFramePool(None, self.height, self.width, sequences, int(data.get("source_cache_size", 256)), cache_mode)
+        self.grid_shape = dense_grid_shape(self.sample_height // 2, self.sample_width, tuple(config.get("model", {}).get("channel_mult", [1, 2, 4, 4])))
 
     def __len__(self) -> int:
         return self.length
@@ -127,7 +134,6 @@ class OnlineSyntheticCadenceDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         seed = self.sample_seed(index)
         rng = np.random.default_rng(seed)
-        label = sample_class_index(rng, self.class_distribution)
         if self.crop_height > 0:
             crop_seed = int((seed + 1597463007) % (2**31 - 1))
             source_crop = RandomCropSpec(self.crop_height, self.crop_width, self.crop_modulo, crop_seed)
@@ -137,11 +143,20 @@ class OnlineSyntheticCadenceDataset(Dataset):
             source_crop = None
             sample_height = self.height
             sample_width = self.width
-        frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
+        if self.mixed_cadence_chance > 0.0 and rng.random() < self.mixed_cadence_chance:
+            mixed = generate_mixed_cadence_sample(rng, sample_height, sample_width, self.field_order, self.source_pool, self.class_distribution, self.grid_shape, self.mixed_boundary_cells, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
+            frames = mixed.frames
+            label = int(mixed.labels[0])
+            label_map = mixed.label_map
+        else:
+            label = sample_class_index(rng, self.class_distribution)
+            frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
+            label_map = np.full(self.grid_shape, label, dtype=np.int64)
         fields = frames_to_field_tensor(frames, self.field_order)
         return {
             "fields": torch.from_numpy(fields),
             "label": torch.tensor(label, dtype=torch.long),
+            "label_map": torch.from_numpy(label_map),
             "frame_index": int(index),
             "sample_path": f"online:{self.split}:{index}",
         }

@@ -7,7 +7,7 @@ def test_class_mapping() -> None:
     assert class_id(0) == "0"
     assert class_id(5) == "V"
     assert class_index("film_phase_3") == 3
-    assert class_index("U") == 8
+    assert class_index("U") == 7
 
 
 def test_prediction_to_json_schema() -> None:
@@ -22,5 +22,5 @@ def test_prediction_to_json_schema() -> None:
     assert result["film_conf"] == 0.912346
     assert result["video_conf"] == 0.087654
     assert "recommended_action" not in result
-    assert set(result["probs"].keys()) == {"pd_0", "pd_1", "pd_2", "pd_3", "pd_4", "video", "blend", "sc", "unknown"}
+    assert set(result["probs"].keys()) == {"pd_0", "pd_1", "pd_2", "pd_3", "pd_4", "video", "blend", "unknown"}
     assert result["probs"]["pd_2"] == 0.912346

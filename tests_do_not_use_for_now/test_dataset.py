@@ -46,6 +46,9 @@ def online_config(tmp_path):
             "noise_std": 0.0,
             "class_distribution": {"film_phase_0": 1.0},
         },
+        "model": {
+            "channel_mult": [1, 2, 4, 4],
+        },
     }
 
 
@@ -57,6 +60,7 @@ def test_online_synthetic_dataset_shape_and_split_lengths(tmp_path) -> None:
     assert len(train_dataset) == 9
     assert len(val_dataset) == 1
     assert sample["fields"].shape == (22, 16, 48)
+    assert sample["label_map"].shape == (2, 6)
     assert int(sample["label"]) == 0
 
 
@@ -103,3 +107,4 @@ def test_online_synthetic_dataset_applies_crop_shape(tmp_path) -> None:
     dataset = OnlineSyntheticCadenceDataset(config, "train")
     sample = dataset[0]
     assert sample["fields"].shape == (22, 8, 32)
+    assert sample["label_map"].shape == (1, 4)

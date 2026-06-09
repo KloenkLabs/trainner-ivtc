@@ -15,7 +15,7 @@ from trainner_ivtc.train import train
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a training sweep for global luma cadence classifier configs.")
+    parser = argparse.ArgumentParser(description="Run a training sweep for dense luma cadence classifier configs.")
     parser.add_argument("--base-config", required=True, help="Base YAML config to copy from.")
     parser.add_argument("--sweep-dir", default="experiments/sweeps/voy_intro_luma_v1", help="Directory for generated configs and result summaries.")
     parser.add_argument("--overwrite-datasets", action="store_true", help="Regenerate sweep datasets even if manifests already exist.")

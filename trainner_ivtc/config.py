@@ -53,6 +53,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "factor_range": [0.55, 0.90],
             },
         },
+        "mixed_cadence": {
+            "chance": 0.0,
+            "boundary_cells": 1,
+        },
     },
     "model": {
         "base_channels": 32,
@@ -187,6 +191,22 @@ def validate_augmentations_config(config: dict[str, Any], config_path: Path) -> 
     }
 
 
+def validate_mixed_cadence_config(config: dict[str, Any], config_path: Path) -> None:
+    data = config["data"]
+    mixed_cadence = data.get("mixed_cadence", {})
+    if mixed_cadence is None:
+        mixed_cadence = {}
+    if not isinstance(mixed_cadence, dict):
+        raise ValueError(f"{config_path}: data.mixed_cadence must be a mapping")
+    boundary_cells = int(mixed_cadence.get("boundary_cells", 1))
+    if boundary_cells < 0:
+        raise ValueError(f"{config_path}: data.mixed_cadence.boundary_cells must be >= 0")
+    data["mixed_cadence"] = {
+        "chance": validate_chance(mixed_cadence.get("chance", 0.0), "data.mixed_cadence.chance", config_path),
+        "boundary_cells": boundary_cells,
+    }
+
+
 def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data = config["data"]
     dataset_mode = str(data.get("dataset_mode", "online"))
@@ -233,6 +253,7 @@ def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data["crop_width"] = crop_width
     data["crop_modulo"] = crop_modulo
     validate_augmentations_config(config, config_path)
+    validate_mixed_cadence_config(config, config_path)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:

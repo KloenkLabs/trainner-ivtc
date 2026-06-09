@@ -15,6 +15,7 @@ import torch
 from PIL import Image
 
 from trainner_ivtc.fields import FieldOrder, frames_to_field_tensor, telecine_pair_for_frame, validate_field_order, validate_window_frames, weave_field_pair
+from trainner_ivtc.grid import GRID_IGNORE_INDEX
 from trainner_ivtc.image_io import iter_image_paths, load_luma_image, save_luma_image
 from trainner_ivtc.labels import CLASS_NAMES, CLASS_TO_INDEX, class_id
 
@@ -31,6 +32,13 @@ class RandomCropSpec:
 
 
 SourceCrop = CropBox | RandomCropSpec
+
+
+@dataclass(frozen=True)
+class MixedCadenceSample:
+    frames: list[np.ndarray]
+    label_map: np.ndarray
+    labels: tuple[int, int]
 
 
 @dataclass
@@ -292,6 +300,75 @@ def generate_blend_frames(rng: np.random.Generator, height: int, width: int, fie
 def generate_blend_window(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> np.ndarray:
     frames = generate_blend_frames(rng, height, width, field_order, source_pool, window_frames, source_crop)
     return frames_to_field_tensor(frames, field_order)
+
+
+def sample_mixed_film_labels(rng: np.random.Generator, distribution: dict[str, float]) -> tuple[int, int]:
+    indices = np.arange(5, dtype=np.int64)
+    weights = np.asarray([float(distribution.get(CLASS_NAMES[i], 0.0)) for i in indices], dtype=np.float64)
+    if float(weights.sum()) <= 0:
+        weights = np.ones_like(weights)
+    weights = weights / weights.sum()
+    first = int(rng.choice(indices, p=weights))
+    second_weights = weights.copy()
+    second_weights[first] = 0.0
+    if float(second_weights.sum()) <= 0:
+        second_weights = np.ones_like(weights)
+        second_weights[first] = 0.0
+    second_weights = second_weights / second_weights.sum()
+    second = int(rng.choice(indices, p=second_weights))
+    return first, second
+
+
+def choose_mixed_split_cell(rng: np.random.Generator, axis_cells: int, boundary_cells: int) -> tuple[int, int]:
+    if axis_cells < 3:
+        return max(1, axis_cells // 2), 0
+    boundary_cells = min(max(int(boundary_cells), 0), max((axis_cells - 3) // 2, 0))
+    min_split = boundary_cells + 1
+    max_split = axis_cells - boundary_cells - 1
+    preferred_low = max(min_split, int(round(axis_cells * 0.35)))
+    preferred_high = min(max_split, int(round(axis_cells * 0.65)))
+    if preferred_low > preferred_high:
+        preferred_low = min_split
+        preferred_high = max_split
+    return int(rng.integers(preferred_low, preferred_high + 1)), boundary_cells
+
+
+def mixed_label_map(grid_shape: tuple[int, int], first_label: int, second_label: int, vertical_split: bool, split_cell: int, boundary_cells: int) -> np.ndarray:
+    grid_height, grid_width = grid_shape
+    label_map = np.full((grid_height, grid_width), GRID_IGNORE_INDEX, dtype=np.int64)
+    if vertical_split:
+        left_end = max(split_cell - boundary_cells, 0)
+        right_start = min(split_cell + boundary_cells, grid_width)
+        label_map[:, :left_end] = first_label
+        label_map[:, right_start:] = second_label
+    else:
+        top_end = max(split_cell - boundary_cells, 0)
+        bottom_start = min(split_cell + boundary_cells, grid_height)
+        label_map[:top_end, :] = first_label
+        label_map[bottom_start:, :] = second_label
+    return label_map
+
+
+def generate_mixed_cadence_sample(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, source_pool: SourceFramePool | None, distribution: dict[str, float], grid_shape: tuple[int, int], boundary_cells: int = 1, augmentations: dict[str, Any] | None = None, augmentations_enabled: bool = True, window_frames: int = 11, source_crop: SourceCrop | None = None) -> MixedCadenceSample:
+    first_label, second_label = sample_mixed_film_labels(rng, distribution)
+    first_frames = generate_telecine_frames(rng, height, width, first_label, field_order, source_pool, window_frames, source_crop)
+    second_frames = generate_telecine_frames(rng, height, width, second_label, field_order, source_pool, window_frames, source_crop)
+    frame_height, frame_width = first_frames[0].shape
+    grid_height, grid_width = grid_shape
+    vertical_split = grid_width >= grid_height if grid_width != grid_height else bool(rng.integers(0, 2))
+    split_cell, boundary_cells = choose_mixed_split_cell(rng, grid_width if vertical_split else grid_height, boundary_cells)
+    if vertical_split:
+        split_pixel = min(max(int(round(frame_width * split_cell / max(grid_width, 1))), 1), frame_width - 1)
+        mask = np.zeros((frame_height, frame_width), dtype=bool)
+        mask[:, :split_pixel] = True
+    else:
+        split_pixel = min(max(int(round(frame_height * split_cell / max(grid_height, 1))), 1), frame_height - 1)
+        mask = np.zeros((frame_height, frame_width), dtype=bool)
+        mask[:split_pixel, :] = True
+    frames = [np.where(mask, first, second).astype(np.uint8) for first, second in zip(first_frames, second_frames, strict=True)]
+    frames = apply_window_augmentations(rng, frames, augmentations, augmentations_enabled)
+    label_map = mixed_label_map(grid_shape, first_label, second_label, vertical_split, split_cell, boundary_cells)
+    return MixedCadenceSample(frames=frames, label_map=label_map, labels=(first_label, second_label))
 
 
 # def generate_unknown_frames(rng: np.random.Generator, height: int, width: int, field_order: FieldOrder, window_frames: int = 11) -> list[np.ndarray]:

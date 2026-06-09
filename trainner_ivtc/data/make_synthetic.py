@@ -7,7 +7,7 @@ from trainner_ivtc.data.synthetic import make_synthetic_dataset
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate synthetic global cadence classification samples.")
+    parser = argparse.ArgumentParser(description="Generate synthetic cadence classification samples.")
     parser.add_argument("--config", required=True, help="Path to a YAML config.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite matching generated sample files.")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker threads. Defaults to data.num_workers, or CPU core count when set to auto.")

@@ -16,9 +16,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from trainner_ivtc.config import load_config, save_config
 from trainner_ivtc.dataset import CadenceFrameDataset, OnlineSyntheticCadenceDataset, manifest_path
+from trainner_ivtc.grid import GRID_IGNORE_INDEX, dense_targets_from_labels, global_logits_from_dense
 from trainner_ivtc.image_io import save_luma_image
 from trainner_ivtc.labels import CLASS_NAMES
-from trainner_ivtc.metrics import active_class_indices_from_distribution, summarize_class_matches, summarize_classification
+from trainner_ivtc.metrics import active_class_indices_from_distribution, summarize_class_matches, summarize_classification, summarize_grid_predictions
 from trainner_ivtc.model import build_model
 
 
@@ -26,7 +27,7 @@ LOGGER_NAME = "trainner_ivtc.train"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the global luma cadence classifier.")
+    parser = argparse.ArgumentParser(description="Train the dense luma cadence classifier.")
     parser.add_argument("--config", required=True, help="Path to a YAML config.")
     parser.add_argument("--dump-otf-val", type=int, default=0, help="Dump up to N augmented online training windows as horizontal JPG strips in output_dir/otf_val. 0 disables dumping.")
     args = parser.parse_args()
@@ -68,6 +69,18 @@ def prepare_fields(fields: torch.Tensor, device: torch.device) -> torch.Tensor:
     if fields.dtype == torch.uint8:
         return fields.float().div_(255.0)
     return fields.float()
+
+
+def prepare_dense_targets(batch: dict[str, torch.Tensor], dense_logits: torch.Tensor, device: torch.device) -> torch.Tensor:
+    grid_height = int(dense_logits.shape[-2])
+    grid_width = int(dense_logits.shape[-1])
+    if "label_map" in batch:
+        label_map = batch["label_map"].to(device, non_blocking=True).long()
+        if tuple(label_map.shape[-2:]) != (grid_height, grid_width):
+            raise ValueError(f"Expected label_map grid {(grid_height, grid_width)}, got {tuple(label_map.shape[-2:])}")
+        return label_map
+    labels = batch["label"].to(device, non_blocking=True)
+    return dense_targets_from_labels(labels, grid_height, grid_width)
 
 
 def field_tensor_to_luma_strip(fields: torch.Tensor, field_order: str) -> np.ndarray:
@@ -154,15 +167,22 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, amp: bo
     model.eval()
     logits_list: list[torch.Tensor] = []
     targets_list: list[torch.Tensor] = []
+    grid_predictions_list: list[torch.Tensor] = []
+    grid_targets_list: list[torch.Tensor] = []
     with torch.inference_mode():
         for batch in loader:
             fields = prepare_fields(batch["fields"], device)
             targets = batch["label"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp and device.type == "cuda"):
-                logits = model(fields)
-            logits_list.append(logits.detach().cpu())
+                dense_logits = model(fields)
+            dense_targets = prepare_dense_targets(batch, dense_logits, device)
+            logits_list.append(global_logits_from_dense(dense_logits).detach().cpu())
             targets_list.append(targets.detach().cpu())
-    return summarize_classification(torch.cat(logits_list, dim=0), torch.cat(targets_list, dim=0), active_class_indices)
+            grid_predictions_list.append(torch.argmax(dense_logits.detach().cpu(), dim=1))
+            grid_targets_list.append(dense_targets.detach().cpu())
+    metrics = summarize_classification(torch.cat(logits_list, dim=0), torch.cat(targets_list, dim=0), active_class_indices)
+    metrics["grid"] = summarize_grid_predictions(torch.cat(grid_predictions_list, dim=0), torch.cat(grid_targets_list, dim=0), active_class_indices, GRID_IGNORE_INDEX)
+    return metrics
 
 
 def save_checkpoint(path: Path, model: nn.Module, config: dict[str, Any], epoch: int, metrics: dict[str, Any]) -> None:
@@ -171,6 +191,7 @@ def save_checkpoint(path: Path, model: nn.Module, config: dict[str, Any], epoch:
         {
             "epoch": epoch,
             "model_state": model.state_dict(),
+            "model_type": "dense_grid_v1",
             "model": config["model"],
             "window_frames": int(config["data"]["window_frames"]),
             "field_order": str(config["data"]["field_order"]),
@@ -208,7 +229,7 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
     val_loader = make_loader(val_dataset, int(training["batch_size"]), int(training["num_workers"]), shuffle=False, prefetch_factor=prefetch_factor)
     model = build_model(config["model"], in_channels=int(config["data"]["window_frames"]) * 2).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(training["learning_rate"]), weight_decay=float(training["weight_decay"]))
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=GRID_IGNORE_INDEX)
     scaler = GradScaler(device="cuda", enabled=amp and device.type == "cuda")
     active_class_indices = active_class_indices_from_distribution(config["data"]["class_distribution"])
     active_class_names = [CLASS_NAMES[i] for i in active_class_indices]
@@ -244,11 +265,11 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
             total_iters += 1
             dumped_otf_val = dump_otf_val_windows(batch, output_dir, field_order, dump_otf_val, dumped_otf_val, epoch, step)
             fields = prepare_fields(batch["fields"], device)
-            targets = batch["label"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp and device.type == "cuda"):
-                logits = model(fields)
-                loss = criterion(logits, targets)
+                dense_logits = model(fields)
+                dense_targets = prepare_dense_targets(batch, dense_logits, device)
+                loss = criterion(dense_logits, dense_targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -274,7 +295,8 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
         metrics = evaluate(model, val_loader, device, amp, active_class_indices)
         final_metrics = metrics
         train_loss = running_loss / max(len(train_loader), 1)
-        logger.info("epoch=%02d  train_loss=%.5f  train_it_s=%.3f  val_accuracy=%.4f  val_macro_f1=%.4f", epoch, train_loss, train_it_s, float(metrics["accuracy"]), float(metrics["macro_f1"]))
+        grid_metrics = metrics["grid"]
+        logger.info("epoch=%02d  train_loss=%.5f  train_it_s=%.3f  val_accuracy=%.4f  val_macro_f1=%.4f  grid_accuracy=%.4f  grid_ignored=%.4f", epoch, train_loss, train_it_s, float(metrics["accuracy"]), float(metrics["macro_f1"]), float(grid_metrics["accuracy"]), float(grid_metrics["ignored_fraction"]))
         logger.debug("epoch_metrics_json=%s", json.dumps({"epoch": epoch, "loss": train_loss, "val": metrics}, separators=(",", ":")))
         save_checkpoint(last_checkpoint_path, model, config, epoch, metrics)
         if float(metrics["macro_f1"]) > best_macro_f1:
@@ -286,6 +308,8 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
     final_macro_f1 = float(final_metrics["macro_f1"]) if final_metrics is not None else 0.0
     logger.info("Training complete:\n%d iters in %s - avg_it_s=%.2f  best_macro_f1=%.4f  final_accuracy=%.4f  final_macro_f1=%.4f", total_iters, format_duration(elapsed), avg_iter_per_second, best_macro_f1, final_accuracy, final_macro_f1)
     if final_metrics is not None:
+        grid_metrics = final_metrics["grid"]
+        logger.info("Final grid metrics: accuracy=%.4f macro_f1=%.4f ignored=%.4f mixed_class_recall=%.4f mixed_sample_recall=%.4f mixed_samples=%d", float(grid_metrics["accuracy"]), float(grid_metrics["macro_f1"]), float(grid_metrics["ignored_fraction"]), float(grid_metrics["mixed_class_recall"]), float(grid_metrics["mixed_sample_recall"]), int(grid_metrics["mixed_samples"]))
         class_matches = summarize_class_matches(final_metrics, active_class_indices)
         most_matched = sorted(class_matches, key=lambda row: (int(row["correct"]), float(row["recall"])), reverse=True)
         least_matched = sorted(class_matches, key=lambda row: (int(row["correct"]), float(row["recall"])))

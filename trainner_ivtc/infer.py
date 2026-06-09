@@ -12,24 +12,28 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from trainner_ivtc.fields import FieldOrder, clamped_window_indices, frames_to_field_tensor, validate_field_order
+from trainner_ivtc.grid import encode_probability_map, global_logits_from_dense, grid_map_metadata
 from trainner_ivtc.image_io import iter_image_paths, load_luma_image
-from trainner_ivtc.labels import prediction_to_json
-from trainner_ivtc.model import build_model
+from trainner_ivtc.labels import CLASS_IDS, CLASS_NAMES, prediction_to_json
+from trainner_ivtc.model import build_model, upgrade_legacy_global_state_dict
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run global luma cadence inference on an image sequence or video.")
+    parser = argparse.ArgumentParser(description="Run dense luma cadence inference on an image sequence or video.")
     parser.add_argument("--checkpoint", required=True, help="Path to a trained checkpoint.")
     parser.add_argument("--input", required=True, help="Directory containing extracted interlaced frames, or an MP4/MKV video.")
-    parser.add_argument("--output", required=True, help="Output JSONL path.")
+    parser.add_argument("--output", required=True, help="Output JSONL path, or the base path used to derive the default grid output directory.")
     parser.add_argument("--field-order", choices=["tff", "bff"], default=None, help="Override checkpoint/config field order.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override inference batch size.")
     parser.add_argument("--num-workers", type=int, default=None, help="Override inference data loader workers.")
     parser.add_argument("--prefetch-factor", type=int, default=None, help="Override inference data loader prefetch factor.")
     parser.add_argument("--device", default=None, help="Override inference device.")
+    parser.add_argument("--output-mode", choices=["jsonl", "grid", "both"], default="jsonl", help="Choose JSONL global predictions, dense grid maps, or both.")
+    parser.add_argument("--grid-output-dir", default=None, help="Directory for dense grid maps and grid_meta.json. Defaults to output stem plus _grid.")
     return parser.parse_args()
 
 
@@ -45,7 +49,7 @@ def load_checkpoint_model(checkpoint_path: str | Path, device: torch.device) -> 
     model_config = checkpoint.get("model", {})
     window_frames = int(checkpoint.get("window_frames", 11))
     model = build_model(model_config, in_channels=window_frames * 2).to(device)
-    model.load_state_dict(checkpoint["model_state"])
+    model.load_state_dict(upgrade_legacy_global_state_dict(checkpoint["model_state"]))
     model.eval()
     return model, checkpoint
 
@@ -142,6 +146,13 @@ def resolve_input_paths(input_path: str | Path) -> list[Path]:
     return paths
 
 
+def default_grid_output_dir(output_path: str | Path) -> Path:
+    path = Path(output_path)
+    if path.suffix:
+        return path.with_name(f"{path.stem}_grid")
+    return path
+
+
 def run_inference(
     checkpoint_path: str | Path,
     input_dir: str | Path,
@@ -151,6 +162,8 @@ def run_inference(
     device_override: str | None = None,
     num_workers_override: int | None = None,
     prefetch_factor_override: int | None = None,
+    output_mode: str = "jsonl",
+    grid_output_dir: str | Path | None = None,
 ) -> None:
     start_time = time.perf_counter()
     device = resolve_device(device_override)
@@ -169,36 +182,71 @@ def run_inference(
         raise ValueError(f"num_workers must be >= 0, got {num_workers}")
     if prefetch_factor < 1:
         raise ValueError(f"prefetch_factor must be >= 1, got {prefetch_factor}")
+    if output_mode not in {"jsonl", "grid", "both"}:
+        raise ValueError(f"output_mode must be 'jsonl', 'grid', or 'both', got {output_mode!r}")
+    write_jsonl = output_mode in {"jsonl", "both"}
+    write_grid = output_mode in {"grid", "both"}
     paths = resolve_input_paths(input_dir)
+    source_frame_shape = load_luma_image(paths[0]).shape
     total_batches = (len(paths) + batch_size - 1) // batch_size
     progress_freq = max(1, total_batches // 20)
     cache_size = max(256, window_frames * batch_size * 2)
     dataset = InferenceFrameDataset(paths, window_frames, field_order, cache_size)
     loader = make_inference_loader(dataset, batch_size, num_workers, prefetch_factor, device)
-    print(f"Starting inference: frames={len(paths)} batches={total_batches} batch_size={batch_size} num_workers={num_workers} prefetch_factor={prefetch_factor} device={device} field_order={field_order} window_frames={window_frames}", flush=True)
     out_path = Path(output_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f, torch.inference_mode():
-        for batch_index, batch in enumerate(loader, start=1):
-            tensor = batch["fields"].to(device, non_blocking=True)
-            logits = model(tensor)
-            probabilities = torch.softmax(logits.float(), dim=1).cpu()
-            frame_indices = [int(frame_index) for frame_index in batch["frame_index"].tolist()]
-            for frame_index, probs in zip(frame_indices, probabilities, strict=False):
-                f.write(json.dumps(prediction_to_json(frame_index, probs), separators=(",", ":")) + "\n")
-            if batch_index == 1 or batch_index == total_batches or batch_index % progress_freq == 0:
-                processed = min(batch_index * batch_size, len(paths))
-                elapsed = time.perf_counter() - start_time
-                fps = processed / elapsed if elapsed > 0 else 0.0
-                print(f"inference batch={batch_index}/{total_batches} frames={processed}/{len(paths)} fps={fps:.2f}", flush=True)
+    grid_dir = Path(grid_output_dir) if grid_output_dir is not None else default_grid_output_dir(out_path)
+    maps_dir = grid_dir / "maps"
+    if write_jsonl:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    if write_grid:
+        maps_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Starting inference: frames={len(paths)} batches={total_batches} batch_size={batch_size} num_workers={num_workers} prefetch_factor={prefetch_factor} device={device} field_order={field_order} window_frames={window_frames} output_mode={output_mode}", flush=True)
+    jsonl_file = out_path.open("w", encoding="utf-8") if write_jsonl else None
+    first_grid_shape: tuple[int, int] | None = None
+    try:
+        with torch.inference_mode():
+            for batch_index, batch in enumerate(loader, start=1):
+                tensor = batch["fields"].to(device, non_blocking=True)
+                dense_logits = model(tensor)
+                global_probabilities = torch.softmax(global_logits_from_dense(dense_logits).float(), dim=1).cpu()
+                dense_probabilities = torch.softmax(dense_logits.float(), dim=1).cpu() if write_grid else None
+                if first_grid_shape is None:
+                    first_grid_shape = int(dense_logits.shape[-2]), int(dense_logits.shape[-1])
+                frame_indices = [int(frame_index) for frame_index in batch["frame_index"].tolist()]
+                for offset, (frame_index, probs) in enumerate(zip(frame_indices, global_probabilities, strict=False)):
+                    if jsonl_file is not None:
+                        jsonl_file.write(json.dumps(prediction_to_json(frame_index, probs), separators=(",", ":")) + "\n")
+                    if dense_probabilities is not None:
+                        encoded = encode_probability_map(dense_probabilities[offset])
+                        Image.fromarray(encoded, mode="RGB").save(maps_dir / f"{frame_index:08d}.png")
+                if batch_index == 1 or batch_index == total_batches or batch_index % progress_freq == 0:
+                    processed = min(batch_index * batch_size, len(paths))
+                    elapsed = time.perf_counter() - start_time
+                    fps = processed / elapsed if elapsed > 0 else 0.0
+                    print(f"inference batch={batch_index}/{total_batches} frames={processed}/{len(paths)} fps={fps:.2f}", flush=True)
+    finally:
+        if jsonl_file is not None:
+            jsonl_file.close()
+    if write_grid:
+        assert first_grid_shape is not None
+        model_config = checkpoint.get("model", {})
+        metadata = grid_map_metadata(source_frame_shape, first_grid_shape, tuple(model_config.get("channel_mult", [1, 2, 4, 4])), field_order, str(checkpoint_path), CLASS_NAMES, CLASS_IDS)
+        metadata["frames"] = len(paths)
+        metadata["maps_dir"] = "maps"
+        (grid_dir / "grid_meta.json").write_text(json.dumps(metadata, indent=4), encoding="utf-8")
     elapsed = time.perf_counter() - start_time
     fps = len(paths) / elapsed if elapsed > 0 else 0.0
-    print(f"Inference complete: frames={len(paths)} elapsed={elapsed:.2f}s fps={fps:.2f} output={out_path}", flush=True)
+    outputs = []
+    if write_jsonl:
+        outputs.append(str(out_path))
+    if write_grid:
+        outputs.append(str(grid_dir))
+    print(f"Inference complete: frames={len(paths)} elapsed={elapsed:.2f}s fps={fps:.2f} output={', '.join(outputs)}", flush=True)
 
 
 def main() -> None:
     args = parse_args()
-    run_inference(args.checkpoint, args.input, args.output, args.field_order, args.batch_size, args.device, args.num_workers, args.prefetch_factor)
+    run_inference(args.checkpoint, args.input, args.output, args.field_order, args.batch_size, args.device, args.num_workers, args.prefetch_factor, args.output_mode, args.grid_output_dir)
 
 
 if __name__ == "__main__":
