@@ -35,6 +35,14 @@ SourceCrop = CropBox | RandomCropSpec
 
 
 @dataclass(frozen=True)
+class SourceFrameSpan:
+    frames: list[np.ndarray]
+    sequence_index: int
+    start: int
+    count: int
+
+
+@dataclass(frozen=True)
 class MixedCadenceSample:
     frames: list[np.ndarray]
     label_map: np.ndarray
@@ -161,12 +169,33 @@ class SourceFramePool:
                 self.cache.popitem(last=False)
         return self.crop_frame(frame, crop_box)
 
-    def sample_frames(self, rng: np.random.Generator, count: int, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
-        sequence = self.sequences[int(rng.integers(0, len(self.sequences)))]
-        crop_box = self.crop_box_for_sequence(sequence, source_crop)
+    def choose_span_start(self, rng: np.random.Generator, sequence_index: int, count: int, avoid: SourceFrameSpan | None = None) -> int:
+        sequence = self.sequences[sequence_index]
         start_max = max(len(sequence) - count, 0)
-        start = int(rng.integers(0, start_max + 1)) if start_max > 0 else 0
-        return [self.load_frame(sequence[(start + i) % len(sequence)], crop_box) for i in range(count)]
+        if start_max <= 0:
+            return 0
+        if avoid is not None and avoid.sequence_index == sequence_index and len(sequence) >= count * 2:
+            starts = [start for start in range(start_max + 1) if start + count <= avoid.start or start >= avoid.start + avoid.count]
+            if starts:
+                return int(starts[int(rng.integers(0, len(starts)))])
+        return int(rng.integers(0, start_max + 1))
+
+    def choose_span_sequence_index(self, rng: np.random.Generator, avoid: SourceFrameSpan | None = None, prefer_different_sequence: bool = False) -> int:
+        if avoid is not None and prefer_different_sequence and len(self.sequences) > 1:
+            choices = [index for index in range(len(self.sequences)) if index != avoid.sequence_index]
+            return int(choices[int(rng.integers(0, len(choices)))])
+        return int(rng.integers(0, len(self.sequences)))
+
+    def sample_frame_span(self, rng: np.random.Generator, count: int, source_crop: SourceCrop | None = None, avoid: SourceFrameSpan | None = None, prefer_different_sequence: bool = False) -> SourceFrameSpan:
+        sequence_index = self.choose_span_sequence_index(rng, avoid, prefer_different_sequence)
+        sequence = self.sequences[sequence_index]
+        crop_box = self.crop_box_for_sequence(sequence, source_crop)
+        start = self.choose_span_start(rng, sequence_index, count, avoid)
+        frames = [self.load_frame(sequence[(start + i) % len(sequence)], crop_box) for i in range(count)]
+        return SourceFrameSpan(frames=frames, sequence_index=sequence_index, start=start, count=count)
+
+    def sample_frames(self, rng: np.random.Generator, count: int, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
+        return self.sample_frame_span(rng, count, source_crop).frames
 
 
 def split_sequence_paths(paths: list[Path], train_pct: int) -> tuple[list[Path], list[Path]]:
@@ -251,7 +280,7 @@ def apply_window_augmentations(rng: np.random.Generator, frames: list[np.ndarray
     return [frame.astype(np.uint8) for frame in frames]
 
 
-def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
+def telecine_window_source_count(target_phase: int, window_frames: int) -> tuple[list[tuple[int, int]], int, int, int]:
     window_frames = validate_window_frames(window_frames)
     radius = window_frames // 2
     target_video_index = 10 + target_phase
@@ -259,9 +288,15 @@ def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, 
     pairs = [telecine_pair_for_frame(index) for index in video_indices]
     min_film = min(min(pair) for pair in pairs)
     max_film = max(max(pair) for pair in pairs)
-    count = max_film - min_film + 1
+    return pairs, min_film, max_film, max_film - min_film + 1
+
+
+def generate_telecine_frames_with_span(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None, avoid_span: SourceFrameSpan | None = None, prefer_different_sequence: bool = False) -> tuple[list[np.ndarray], SourceFrameSpan | None]:
+    pairs, min_film, _max_film, count = telecine_window_source_count(target_phase, window_frames)
+    source_span = None
     if source_pool is not None and source_pool.available:
-        progressive_frames = source_pool.sample_frames(rng, count, source_crop)
+        source_span = source_pool.sample_frame_span(rng, count, source_crop, avoid_span, prefer_different_sequence)
+        progressive_frames = source_span.frames
     else:
         clip = make_procedural_clip(rng, height, width, motion=True)
         progressive_frames = [clip.frame(i) for i in range(count)]
@@ -270,7 +305,37 @@ def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, 
         first = progressive_frames[first_index - min_film]
         second = progressive_frames[second_index - min_film]
         frames.append(weave_field_pair(first, second, field_order))
+    return frames, source_span
+
+
+def generate_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
+    frames, _source_span = generate_telecine_frames_with_span(rng, height, width, target_phase, field_order, source_pool, window_frames, source_crop)
     return frames
+
+
+def sample_other_film_label(rng: np.random.Generator, distribution: dict[str, float], excluded_label: int) -> int:
+    indices = np.arange(5, dtype=np.int64)
+    weights = np.asarray([float(distribution.get(CLASS_NAMES[i], 0.0)) for i in indices], dtype=np.float64)
+    weights[excluded_label] = 0.0
+    if float(weights.sum()) <= 0:
+        weights = np.ones_like(weights)
+        weights[excluded_label] = 0.0
+    weights = weights / weights.sum()
+    return int(rng.choice(indices, p=weights))
+
+
+def generate_scene_change_telecine_frames(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, distribution: dict[str, float], augmentations: dict[str, Any] | None = None, augmentations_enabled: bool = True, window_frames: int = 11, source_crop: SourceCrop | None = None) -> list[np.ndarray]:
+    window_frames = validate_window_frames(window_frames)
+    center = window_frames // 2
+    cut_frame_index = int(rng.integers(1, window_frames))
+    other_phase = sample_other_film_label(rng, distribution, target_phase)
+    target_frames, target_span = generate_telecine_frames_with_span(rng, height, width, target_phase, field_order, source_pool, window_frames, source_crop)
+    other_frames, _other_span = generate_telecine_frames_with_span(rng, height, width, other_phase, field_order, source_pool, window_frames, source_crop, target_span, prefer_different_sequence=True)
+    if cut_frame_index <= center:
+        frames = other_frames[:cut_frame_index] + target_frames[cut_frame_index:]
+    else:
+        frames = target_frames[:cut_frame_index] + other_frames[cut_frame_index:]
+    return apply_window_augmentations(rng, frames, augmentations, augmentations_enabled)
 
 
 def generate_telecine_window(rng: np.random.Generator, height: int, width: int, target_phase: int, field_order: FieldOrder, source_pool: SourceFramePool | None, window_frames: int = 11, source_crop: SourceCrop | None = None) -> np.ndarray:

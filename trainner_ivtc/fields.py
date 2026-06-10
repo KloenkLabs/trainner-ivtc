@@ -68,6 +68,43 @@ def frames_to_field_tensor(frames: list[np.ndarray], field_order: FieldOrder = "
     return np.stack(fields, axis=0)
 
 
+def scene_diff_field_channel(frames: list[np.ndarray]) -> np.ndarray:
+    if not frames:
+        raise ValueError("frames must contain at least one luma image")
+    center = len(frames) // 2
+    current = ensure_even_luma(frames[center])
+    previous = ensure_even_luma(frames[max(center - 1, 0)])
+    if current.shape != previous.shape:
+        raise ValueError(f"Scene diff frames must have matching shapes, got {current.shape} and {previous.shape}")
+    diff = np.abs(current.astype(np.int16) - previous.astype(np.int16))
+    return ((diff[0::2, :] + diff[1::2, :] + 1) // 2).astype(np.uint8)
+
+
+def frames_to_model_tensor(frames: list[np.ndarray], field_order: FieldOrder = "tff", scene_diff: bool = False) -> np.ndarray:
+    fields = frames_to_field_tensor(frames, field_order)
+    if not scene_diff:
+        return fields
+    diff = scene_diff_field_channel(frames)
+    if diff.shape != fields.shape[-2:]:
+        raise ValueError(f"Scene diff channel must have shape {fields.shape[-2:]}, got {diff.shape}")
+    return np.concatenate([fields, diff[np.newaxis, :, :]], axis=0)
+
+
+def input_feature_config(config: dict | None) -> dict[str, bool]:
+    features = (config or {}).get("input_features", {})
+    if features is None:
+        features = {}
+    return {
+        "scene_diff": bool(features.get("scene_diff", False)),
+    }
+
+
+def input_channel_count(window_frames: int, input_features: dict[str, bool] | None = None) -> int:
+    window_frames = validate_window_frames(window_frames)
+    features = input_features or {}
+    return window_frames * 2 + (1 if bool(features.get("scene_diff", False)) else 0)
+
+
 def telecine_phase_for_frame(video_frame_index: int, phase_offset: int = 0) -> int:
     return (video_frame_index + phase_offset) % 5
 

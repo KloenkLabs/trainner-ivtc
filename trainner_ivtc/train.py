@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from trainner_ivtc.config import load_config, save_config
 from trainner_ivtc.dataset import CadenceFrameDataset, OnlineSyntheticCadenceDataset, manifest_path
+from trainner_ivtc.fields import input_channel_count, input_feature_config
 from trainner_ivtc.grid import GRID_IGNORE_INDEX, dense_targets_from_labels, global_logits_from_dense
 from trainner_ivtc.image_io import save_luma_image
 from trainner_ivtc.labels import CLASS_NAMES
@@ -89,8 +90,12 @@ def field_tensor_to_luma_strip(fields: torch.Tensor, field_order: str) -> np.nda
         field_array = fields.numpy()
     else:
         field_array = fields.float().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).numpy()
-    if field_array.ndim != 3 or field_array.shape[0] % 2 != 0:
-        raise ValueError(f"Expected field tensor with shape (2 * window_frames, height, width), got {tuple(field_array.shape)}")
+    if field_array.ndim != 3:
+        raise ValueError(f"Expected field tensor with shape (channels, height, width), got {tuple(field_array.shape)}")
+    if field_array.shape[0] % 2 != 0:
+        field_array = field_array[:-1]
+    if field_array.shape[0] < 2:
+        raise ValueError(f"Expected at least one pair of field channels, got {tuple(fields.shape)}")
     frames = []
     for field_index in range(0, field_array.shape[0], 2):
         first = field_array[field_index]
@@ -195,6 +200,7 @@ def save_checkpoint(path: Path, model: nn.Module, config: dict[str, Any], epoch:
             "model": config["model"],
             "window_frames": int(config["data"]["window_frames"]),
             "field_order": str(config["data"]["field_order"]),
+            "input_features": input_feature_config(config["data"]),
             "class_names": CLASS_NAMES,
             "metrics": metrics,
             "config": config,
@@ -211,13 +217,14 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
     save_config(config, output_dir / "config_resolved.yaml")
     dataset_mode = str(config["data"].get("dataset_mode", "online"))
     logger.info("Preparing datasets: mode=%s source_cache_mode=%s", dataset_mode, config["data"].get("source_cache_mode", "lru"))
+    input_features = input_feature_config(config["data"])
     if dataset_mode == "manifest":
         train_manifest = manifest_path(dataset_dir, "train")
         val_manifest = manifest_path(dataset_dir, "val")
         if not train_manifest.exists() or not val_manifest.exists():
             raise FileNotFoundError(f"Missing synthetic manifests in {dataset_dir}. Run python -m trainner_ivtc.data.make_synthetic --config {config['config_path']} first.")
-        train_dataset = CadenceFrameDataset(train_manifest)
-        val_dataset = CadenceFrameDataset(val_manifest)
+        train_dataset = CadenceFrameDataset(train_manifest, input_features)
+        val_dataset = CadenceFrameDataset(val_manifest, input_features)
     else:
         train_dataset = OnlineSyntheticCadenceDataset(config, "train")
         val_dataset = OnlineSyntheticCadenceDataset(config, "val")
@@ -227,7 +234,7 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
     prefetch_factor = int(training.get("prefetch_factor", 2))
     train_loader = make_loader(train_dataset, int(training["batch_size"]), int(training["num_workers"]), shuffle=True, prefetch_factor=prefetch_factor)
     val_loader = make_loader(val_dataset, int(training["batch_size"]), int(training["num_workers"]), shuffle=False, prefetch_factor=prefetch_factor)
-    model = build_model(config["model"], in_channels=int(config["data"]["window_frames"]) * 2).to(device)
+    model = build_model(config["model"], in_channels=input_channel_count(int(config["data"]["window_frames"]), input_features)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(training["learning_rate"]), weight_decay=float(training["weight_decay"]))
     criterion = nn.CrossEntropyLoss(ignore_index=GRID_IGNORE_INDEX)
     scaler = GradScaler(device="cuda", enabled=amp and device.type == "cuda")
@@ -241,7 +248,7 @@ def train(config: dict[str, Any], dump_otf_val: int = 0) -> None:
     dumped_otf_val = 0
     start_time = time.perf_counter()
     final_metrics: dict[str, Any] | None = None
-    logger.info("Starting training: train_samples=%d val_samples=%d epochs=%d batch_size=%d window_frames=%d", len(train_dataset), len(val_dataset), int(training["epochs"]), int(training["batch_size"]), int(config["data"]["window_frames"]))
+    logger.info("Starting training: train_samples=%d val_samples=%d epochs=%d batch_size=%d window_frames=%d input_features=%s", len(train_dataset), len(val_dataset), int(training["epochs"]), int(training["batch_size"]), int(config["data"]["window_frames"]), json.dumps(input_features, separators=(",", ":")))
     logger.info("Augmentation: augmentations=%s class_distribution=%s", json.dumps(config["data"].get("augmentations", {}), separators=(",", ":")), json.dumps(config["data"].get("class_distribution", {}), separators=(",", ":")))
     logger.info("Macro F1 active classes: %s", ",".join(active_class_names))
     if dump_otf_val > 0:

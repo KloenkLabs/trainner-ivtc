@@ -57,6 +57,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "chance": 0.0,
             "boundary_cells": 1,
         },
+        "scene_change": {
+            "chance": 0.0,
+        },
+        "input_features": {
+            "scene_diff": False,
+        },
     },
     "model": {
         "base_channels": 32,
@@ -207,6 +213,30 @@ def validate_mixed_cadence_config(config: dict[str, Any], config_path: Path) -> 
     }
 
 
+def validate_scene_change_config(config: dict[str, Any], config_path: Path) -> None:
+    data = config["data"]
+    scene_change = data.get("scene_change", {})
+    if scene_change is None:
+        scene_change = {}
+    if not isinstance(scene_change, dict):
+        raise ValueError(f"{config_path}: data.scene_change must be a mapping")
+    data["scene_change"] = {
+        "chance": validate_chance(scene_change.get("chance", 0.0), "data.scene_change.chance", config_path),
+    }
+
+
+def validate_input_features_config(config: dict[str, Any], config_path: Path) -> None:
+    data = config["data"]
+    input_features = data.get("input_features", {})
+    if input_features is None:
+        input_features = {}
+    if not isinstance(input_features, dict):
+        raise ValueError(f"{config_path}: data.input_features must be a mapping")
+    data["input_features"] = {
+        "scene_diff": bool(input_features.get("scene_diff", False)),
+    }
+
+
 def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data = config["data"]
     dataset_mode = str(data.get("dataset_mode", "online"))
@@ -254,6 +284,8 @@ def validate_data_config(config: dict[str, Any], config_path: Path) -> None:
     data["crop_modulo"] = crop_modulo
     validate_augmentations_config(config, config_path)
     validate_mixed_cadence_config(config, config_path)
+    validate_scene_change_config(config, config_path)
+    validate_input_features_config(config, config_path)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:

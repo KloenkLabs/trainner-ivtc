@@ -19,9 +19,19 @@ data:
     train_samples_pct: 90
     val_samples_pct: 10
     dataset_repeats: 1
+    source_cache_mode: lru
     source_cache_size: 256
     resample_train_each_epoch: true
-    noise_std: 2.0
+    augmentations:
+        noise:
+            chance: 1.0
+            std_range: [2.0, 2.0]
+        underexposure:
+            chance: 0.0
+            factor_range: [0.55, 0.90]
+    mixed_cadence:
+        chance: 0.0
+        boundary_cells: 1
     class_distribution:
         film_phase_0: 0.13
         film_phase_1: 0.13
@@ -30,7 +40,6 @@ data:
         film_phase_4: 0.13
         video: 0.15
         blend: 0.08
-        scene_cut: 0.06
         unknown: 0.06
 
 model:
@@ -53,3 +62,5 @@ inference:
     device: cuda
     field_order: tff
     window_frames: 7
+    num_workers: 4
+    prefetch_factor: 2

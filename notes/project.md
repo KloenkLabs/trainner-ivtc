@@ -9,7 +9,7 @@ The model does not reconstruct progressive frames and does not perform IVTC itse
 The v1 scope is intentionally narrow:
 
 - Input: progressive PNG source frames for online synthetic training or materialized synthetic generation, plus pre-extracted frame sequences for inference.
-- Internal model input: luma fields shaped as `[B, window_frames * 2, H / 2, W]`.
+- Internal model input: luma fields shaped as `[B, window_frames * 2, H / 2, W]`, optionally with one extra scene-diff channel.
 - Output: dense cadence logits shaped `[B, classes, grid_h, grid_w]`, plus global logits from spatially averaged dense logits.
 - Deferred: local field matching, RGB/chroma features, ONNX export, and mixed-cadence region reconstruction.
 
@@ -21,12 +21,12 @@ The classifier is a lightweight fully convolutional 2D CNN over stacked luma fie
 
 - Luma frame window is loaded from PNGs.
 - Each interlaced frame is split into top and bottom fields.
-- Fields are stacked along the channel axis.
+- Fields are stacked along the channel axis, with an optional current-vs-previous luma diff channel appended after the field channels.
 - Residual/downsampling blocks extract temporal-spatial features from the stacked field tensor.
 - A 1x1 dense classifier head emits 8 logits per grid cell.
 - Global compatibility logits are derived by averaging dense logits over the grid.
 
-For the current Voyager intro config, an 11-frame 760x480 sample becomes a model tensor of `[22, 240, 760]`. The tested model defaults are `base_channels: 24`, `channel_mult: [1, 2, 4, 4]`, and `dropout: 0.1`.
+For the current Voyager intro config, an 11-frame 760x480 sample becomes a model tensor of `[22, 240, 760]`, or `[23, 240, 760]` when `data.input_features.scene_diff` is enabled. The tested model defaults are `base_channels: 24`, `channel_mult: [1, 2, 4, 4]`, and `dropout: 0.1`.
 
 ## Classes
 
@@ -45,7 +45,13 @@ The model predicts these 8 classes:
 
 Inference emits compact JSONL records with `idx`, `class_id`, `class_name`, `conf`, `film_conf`, `video_conf`, and `probs`. Output class names use `pd_0..pd_4` for pulldown phases. Float values are rounded to 6 decimals.
 
-Grid inference can also write one lossless RGB PNG map per frame under `maps/` plus `grid_meta.json`. Map channels are `R=class_index`, `G=primary confidence scaled to 0..255`, and `B=film confidence scaled to 0..255`. The map is stored at the model-native grid resolution, not upsampled to source frame resolution.
+Grid inference can also write one lossless RGB PNG map per frame under `maps/` plus `grid_meta.json`. Map channels are `R=class_index * class_index_scale`, `G=primary confidence scaled to 0..255`, and `B=film confidence scaled to 0..255`. The red-channel scale is recorded in `grid_meta.json` and makes maps easier to inspect. The map is stored at the model-native grid resolution, not upsampled to source frame resolution.
+
+The optional `--grid-confidence-cutoff` inference argument can zero the green confidence channel and blue film-confidence channel below a chosen probability cutoff, for example `--grid-confidence-cutoff 0.5`. Values at or above the cutoff are not binarized or rescaled.
+
+Passing `--hsv` switches grid-map visualization to class hue instead of the channel layout above. In HSV mode, class `0` starts at hue `0`, each later class advances by `30` degrees, saturation is always maxed, and value is the primary confidence after any `--grid-confidence-cutoff`.
+
+The optional `--json-confidence-cutoff` inference argument changes JSONL aggregation from averaged dense logits to per-cell class prevalence after thresholding. Each grid cell contributes to its argmax class only when its confidence is at or above the cutoff; JSON `conf` and `probs` are fractions of the full grid, so low-confidence discarded cells reduce the total probability mass.
 
 ## Synthetic Data
 
@@ -66,6 +72,8 @@ Dataset split and sizing are source-frame based:
 - Cropping is applied once per temporal window before field splitting, so every frame in the sample uses the same crop.
 - Crop bounds are deterministic from the sample seed and epoch, and train samples use new crops each epoch when `resample_train_each_epoch` is enabled.
 - Training-only augmentations are configured under `data.augmentations`, with independent per-window `chance` values.
+- Online-only temporal scene-change samples are configured under `data.scene_change.chance`. They splice two independently telecined source spans at a full-frame boundary while keeping the target label tied to the target frame's local cadence.
+- Optional model input features are configured under `data.input_features`. `scene_diff: true` appends a current-vs-previous luma absolute-difference channel for the center frame, downsampled to field height by averaging adjacent luma rows. This changes the model input channel count and requires retraining.
 
 The generator currently applies these data variations:
 
@@ -79,6 +87,7 @@ The generator currently applies these data variations:
 - Optional under-exposure by multiplying all frames in a window by a sampled darkening factor.
 - Optional online-only random crop with modulo-aligned crop bounds.
 - Optional mixed-cadence samples that composite two independently generated film phases and return dense per-cell labels with ignored boundary cells.
+- Optional online-only scene-change cadence breaks that prefer frames from a different source sequence, or a non-overlapping span from the same split when only one sequence is available.
 
 Important caveat: procedural `unknown` samples may look like noise or moving synthetic patterns and may contain no recognizable source image. That is data generation behavior, not model dropout. Dropout is only applied inside the model during training.
 
@@ -129,6 +138,8 @@ Useful options include `--field-order`, `--batch-size`, and `--device`. Dense gr
 ```powershell
 python -m trainner_ivtc.infer --checkpoint experiments/mdl3set_7f_3/checkpoints/best.pt --input input_frames --output predictions.jsonl --output-mode both --grid-output-dir predictions_grid
 ```
+
+Inference reads `input_features` from the checkpoint by default. `--scene-diff` and `--no-scene-diff` can override that metadata, but the override must match the checkpoint's trained input channel count.
 
 Example record:
 

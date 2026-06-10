@@ -1,55 +1,74 @@
 seed: 42
 
 paths:
-    # dataset_dir: datasets/synthetic_voy_intro_luma_v1
-    output_dir: experiments/walle_2
+    output_dir: experiments/mdl3set_7f_grid_8
 
 data:
     dataset_mode: online
     source_dirs:
-        - M:/Datasets/Upscale/PretrainVSR/walle/walle-seq9-frames-640x400
+        # - M:/Datasets/Upscale/PretrainVSR/walle/walle-seq9-frames-640x400
+        # - M:/Datasets/Upscale/PretrainVSR/spv/spv-seq9-frames
+        # - M:/Datasets/Upscale/PretrainVSR/tenet2/tenet-seq9-frames
+        # - M:/Datasets/Upscale/PretrainVSR/pris/prisoners_seq9_jpg
+        - M:/Datasets/Upscale/PretrainVSR/stlk/Stalker.Seq7-frames
     field_order: tff
-    window_frames: 9
+    window_frames: 7
     height: 0
     width: 0
-    crop_height: 384
-    crop_width: 512
-    crop_modulo: 16
+    crop_height: 320
+    crop_width: 448
+    crop_modulo: 8
     num_workers: auto
-    train_samples_pct: 93
-    val_samples_pct: 7
-    dataset_repeats: 8
-    source_cache_size: 256
+    train_samples_pct: 94
+    val_samples_pct: 6
+    dataset_repeats: 20
+    source_cache_mode: shared_ram
+    source_cache_size: 512
     resample_train_each_epoch: true
-    noise_std: 0.0 # 2.0
+    augmentations:
+        noise:
+            chance: 0.5
+            std_range: [1.25, 3.5]
+        underexposure:
+            chance: 0.25
+            factor_range: [0.35, 0.9]
+    mixed_cadence:
+        chance: 0 # 0.15
+        boundary_cells: 1
+    scene_change:
+        chance: 0.1
+    input_features:
+        scene_diff: false
     class_distribution:
-        film_phase_0: 0.13
-        film_phase_1: 0.13
-        film_phase_2: 0.13
-        film_phase_3: 0.13
-        film_phase_4: 0.13
-        video: 0 # 0.15
-        blend: 0.06
-        scene_cut: 0 # 0.08
+        film_phase_0: 0.1
+        film_phase_1: 0.1
+        film_phase_2: 0.1
+        film_phase_3: 0.1
+        film_phase_4: 0.1
+        video: 0.0 # 0.15
+        blend: 0.0333 # 0.06
         unknown: 0 # 0.06
 
 model:
     base_channels: 24
-    channel_mult: [1, 2, 4, 4]
+    channel_mult: [1, 2, 4, 4] # [1, 2, 4]
     dropout: 0.1
 
 training:
     batch_size: 8
-    epochs: 3
-    num_workers: 12
+    epochs: 12
+    num_workers: 16
     learning_rate: 0.0003
     weight_decay: 0.01
     amp: true
     device: cuda
-    print_freq: 200
+    print_freq: 1000
+    prefetch_factor: 2
 
 inference:
-    batch_size: 4
+    batch_size: 16
     device: cuda
     field_order: tff
-    window_frames: 9
+    window_frames: 7
+    num_workers: 8
+    prefetch_factor: 2

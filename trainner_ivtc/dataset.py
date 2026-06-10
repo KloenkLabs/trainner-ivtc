@@ -9,10 +9,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from trainner_ivtc.fields import FieldOrder, frames_to_field_tensor, validate_field_order
+from trainner_ivtc.fields import FieldOrder, frames_to_model_tensor, input_feature_config, validate_field_order
 from trainner_ivtc.image_io import load_luma_image
 from trainner_ivtc.grid import dense_grid_shape
-from trainner_ivtc.data.synthetic import CropBox, RandomCropSpec, SourceFramePool, count_sequence_frames, generate_mixed_cadence_sample, generate_sample_frames, sample_class_index, split_source_sequences
+from trainner_ivtc.data.synthetic import CropBox, RandomCropSpec, SourceFramePool, count_sequence_frames, generate_mixed_cadence_sample, generate_sample_frames, generate_scene_change_telecine_frames, sample_class_index, split_source_sequences
 
 
 def random_crop_frames(frames: list[np.ndarray], crop_height: int, crop_width: int, crop_modulo: int, rng: np.random.Generator) -> list[np.ndarray]:
@@ -43,9 +43,10 @@ def random_crop_box(height: int, width: int, crop_height: int, crop_width: int, 
 
 
 class CadenceFrameDataset(Dataset):
-    def __init__(self, manifest_path: str | Path) -> None:
+    def __init__(self, manifest_path: str | Path, input_features: dict[str, bool] | None = None) -> None:
         self.manifest_path = Path(manifest_path)
         self.root = self.manifest_path.parent
+        self.input_features = input_features or {}
         with self.manifest_path.open("r", encoding="utf-8") as f:
             self.records = [json.loads(line) for line in f if line.strip()]
         if not self.records:
@@ -64,9 +65,11 @@ class CadenceFrameDataset(Dataset):
             frame_paths = [self.root / frame_path for frame_path in record["frames"]]
             frames = [load_luma_image(frame_path) for frame_path in frame_paths]
             field_order = validate_field_order(record.get("field_order", "tff"))
-            fields = frames_to_field_tensor(frames, field_order).astype(np.float32) / 255.0
+            fields = frames_to_model_tensor(frames, field_order, bool(self.input_features.get("scene_diff", False))).astype(np.float32) / 255.0
             sample_path = self.root / record.get("sample_dir", Path(record["frames"][0]).parent)
         else:
+            if bool(self.input_features.get("scene_diff", False)):
+                raise ValueError("Scene-diff input cannot be enabled for legacy NPZ samples without frame paths")
             sample_path = self.root / record["sample"]
             with np.load(sample_path) as data:
                 fields = data["fields"].astype(np.float32) / 255.0
@@ -110,6 +113,9 @@ class OnlineSyntheticCadenceDataset(Dataset):
         self.mixed_cadence = data.get("mixed_cadence", {})
         self.mixed_cadence_chance = float(self.mixed_cadence.get("chance", 0.0))
         self.mixed_boundary_cells = int(self.mixed_cadence.get("boundary_cells", 1))
+        self.scene_change = data.get("scene_change", {})
+        self.scene_change_chance = float(self.scene_change.get("chance", 0.0))
+        self.input_features = input_feature_config(data)
         self.augmentations_enabled = split == "train"
         self.class_distribution = data["class_distribution"]
         self.resample_train_each_epoch = bool(data.get("resample_train_each_epoch", True))
@@ -150,9 +156,12 @@ class OnlineSyntheticCadenceDataset(Dataset):
             label_map = mixed.label_map
         else:
             label = sample_class_index(rng, self.class_distribution)
-            frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
+            if label in range(5) and self.scene_change_chance > 0.0 and rng.random() < self.scene_change_chance:
+                frames = generate_scene_change_telecine_frames(rng, sample_height, sample_width, label, self.field_order, self.source_pool, self.class_distribution, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
+            else:
+                frames = generate_sample_frames(rng, sample_height, sample_width, self.field_order, label, self.source_pool, self.augmentations, self.augmentations_enabled, self.window_frames, source_crop)
             label_map = np.full(self.grid_shape, label, dtype=np.int64)
-        fields = frames_to_field_tensor(frames, self.field_order)
+        fields = frames_to_model_tensor(frames, self.field_order, bool(self.input_features.get("scene_diff", False)))
         return {
             "fields": torch.from_numpy(fields),
             "label": torch.tensor(label, dtype=torch.long),
